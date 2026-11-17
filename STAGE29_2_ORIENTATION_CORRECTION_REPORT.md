@@ -222,3 +222,4 @@ python -m realsense_measure.fullbody capture --preview-only --subject-id PREVIEW
 > [!IMPORTANT]
 > **STOP CONDITION OBSERVED:**
 > As specified in the Stage 29.2 instructions, the eight-stop physical scan session S02 has **NOT** been started. The pipeline remains in safe pre-flight state pending operator visual confirmation of the corrected preview.
+
