@@ -292,6 +292,9 @@ class CaptureController:
         self.current_stop = 0
         self.current_retake = 0
         self.n_stops = writer.n_stops
+        self.portrait_rotation = getattr(
+            camera, "portrait_rotation", getattr(writer, "camera_portrait_rotation", "ccw")
+        )
 
         # Injected command queue ("confirm", "skip", "abort", "retake")
         self.command_queue: deque[str] = deque()

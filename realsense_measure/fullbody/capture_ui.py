@@ -97,6 +97,7 @@ def render_frame(
         "DONE": (0, 255, 0),
         "RETAKE": (0, 0, 255),            # Red
         "ABORT": (0, 0, 255),
+        "PREVIEW_ONLY": (255, 200, 0),    # Cyan/Yellow
     }
     state_color = state_colors.get(state, (255, 255, 255))
 
@@ -119,6 +120,20 @@ def render_frame(
     (txt_w, txt_h), _ = cv2.getTextSize(instr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
     instr_x = max(w + 5, comp_w - txt_w - 15)
     cv2.putText(composite, instr_text, (instr_x, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+    # Active orientation indicator (e.g. Orientation: PORTRAIT CCW)
+    orient = str(state_snapshot.get("orientation", "")).strip().lower()
+    if orient in ("cw", "ccw"):
+        orient_text = f"Orientation: PORTRAIT {orient.upper()}"
+    elif orient:
+        orient_text = f"Orientation: {orient.upper()}"
+    else:
+        orient_text = ""
+
+    if orient_text:
+        (o_w, o_h), _ = cv2.getTextSize(orient_text, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+        orient_x = max(w + 5, comp_w - o_w - 15)
+        cv2.putText(composite, orient_text, (orient_x, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
 
     # 3. Live metrics HUD bar
     hud_y = banner_h + 25
@@ -222,6 +237,7 @@ def run_ui_loop(
                     "stop_index": getattr(controller, "current_stop", 0),
                     "n_stops": getattr(controller, "n_stops", 8),
                     "turn_direction": getattr(controller.writer, "turn_direction", "cw"),
+                    "orientation": getattr(controller, "portrait_rotation", getattr(getattr(controller, "writer", None), "camera_portrait_rotation", "ccw")),
                     "current_retake": getattr(controller, "current_retake", 0),
                     "distance_m": getattr(controller, "_latest_distance_m", None),
                     "valid_depth_pct": getattr(controller, "_latest_valid_depth_pct", None),

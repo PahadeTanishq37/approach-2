@@ -44,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--subject-id", type=str, required=True, help="Anonymous subject ID (e.g. SUBJ_01, TEST_42).")
     p_cap.add_argument("--stops", type=int, default=8, help="Number of stops (default: 8).")
     p_cap.add_argument("--turn", type=str, choices=["cw", "ccw"], default="cw", help="Turn direction ('cw' or 'ccw').")
-    p_cap.add_argument("--portrait", type=str, choices=["cw", "ccw"], default="cw", help="Portrait camera orientation ('cw' or 'ccw').")
+    p_cap.add_argument("--portrait", type=str, choices=["cw", "ccw"], default="ccw", help="Portrait camera orientation ('cw' or 'ccw', default: 'ccw').")
+    p_cap.add_argument("--preview-only", action="store_true", help="Launch live operator preview without recording or saving a session.")
     p_cap.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera instead of hardware RealSense.")
     p_cap.add_argument("--burst-frames", type=int, default=30, help="Frames per stop burst (default: 30).")
     p_cap.add_argument("--headless", action="store_true", help="Run without opening GUI preview window.")
@@ -57,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 2. check-camera (Stage 27 hardware sanity check snapshot)
     p_chk = subparsers.add_parser("check-camera", help="Verify RealSense orientation, FOV, and depth sanity (no session).")
-    p_chk.add_argument("--portrait", type=str, choices=["cw", "ccw"], default="cw", help="Portrait rotation ('cw' or 'ccw').")
+    p_chk.add_argument("--portrait", type=str, choices=["cw", "ccw"], default="ccw", help="Portrait rotation ('cw' or 'ccw', default: 'ccw').")
+    p_chk.add_argument("--preview", action="store_true", help="Open an interactive live OpenCV preview window for orientation verification (press Q or ESC to exit).")
     p_chk.add_argument("--out", type=str, default="scan_output", help="Output directory to save check snapshot into DIR/check/.")
     p_chk.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera for headless testing.")
 
@@ -112,7 +114,8 @@ def _run_capture(args: argparse.Namespace) -> int:
         return 1
 
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not getattr(args, "preview_only", False):
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     if getattr(args, "fake", False):
         from tests.fullbody.fake_camera import FakeCamera
@@ -133,6 +136,55 @@ def _run_capture(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"Error: Failed to start camera: {exc}", file=sys.stderr)
         return 1
+
+    if getattr(args, "preview_only", False):
+        print("\n" + "=" * 60)
+        print("FULL-BODY CAPTURE PREVIEW-ONLY MODE")
+        print("=" * 60)
+        print(f"Orientation: PORTRAIT {args.portrait.upper()}")
+        print("Live preview active. No capture session or files will be written to disk.")
+        print("Press 'Q' or ESC in preview window to exit.\n")
+        from realsense_measure.fullbody.capture_ui import render_frame
+        window_name = f"RealSense Live Capture Preview - Orientation: PORTRAIT {args.portrait.upper()} [Press Q to Exit]"
+        try:
+            while True:
+                c, r, f, ts = cam.read_raw_filtered()
+                if c is not None and r is not None:
+                    h_c, w_c = c.shape[:2]
+                    scale = cam.depth_scale
+                    d_m = r.astype(np.float32) * (scale if cam.depth_units == "sensor_units" else 1.0)
+                    roi = d_m[int(0.25 * h_c) : int(0.75 * h_c), int(0.25 * w_c) : int(0.75 * w_c)]
+                    valid_roi = roi[(roi > 0.3) & (roi < 3.5)]
+                    med_depth_m = float(np.median(valid_roi)) if len(valid_roi) > 0 else None
+                    valid_frac = float(len(valid_roi)) / float(roi.size) if roi.size > 0 else 0.0
+
+                    snapshot = {
+                        "state": "PREVIEW_ONLY",
+                        "stop_index": 0,
+                        "n_stops": args.stops,
+                        "turn_direction": args.turn,
+                        "orientation": args.portrait,
+                        "distance_m": med_depth_m,
+                        "valid_depth_pct": valid_frac * 100.0,
+                        "motion_mm": 0.0,
+                        "head_visible": True,
+                        "feet_visible": True,
+                        "burst_progress": 0.0,
+                        "last_rejection_reason": "Preview Only (No Recording)",
+                    }
+                    display_frame = render_frame(snapshot, c, f if f is not None else d_m)
+                    cv2.imshow(window_name, display_frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q"), 27):
+                    break
+        finally:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+            cam.stop()
+        return 0
 
     accepted_stops = 0
     controller: Optional[CaptureController] = None
@@ -238,14 +290,61 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     last_depth: Optional[np.ndarray] = None
 
     try:
-        # Stream for approx 5 seconds or until frames acquired
-        start_time = time.time()
-        while (time.time() - start_time) < 5.0:
-            c, r, f, ts = cam.read_raw_filtered()
-            if c is not None and r is not None:
-                last_color = c
-                last_depth = r
-            time.sleep(0.033)
+        if getattr(args, "preview", False):
+            from realsense_measure.fullbody.capture_ui import render_frame
+            window_name = f"RealSense Camera Check - Orientation: PORTRAIT {args.portrait.upper()} [Press Q to Exit]"
+            print("\n" + "=" * 60)
+            print("REALSENSE CAMERA INTERACTIVE PREVIEW MODE")
+            print("=" * 60)
+            print(f"Orientation: PORTRAIT {args.portrait.upper()}")
+            print(f"Window: '{window_name}'")
+            print("Press 'Q' or ESC in preview window to exit and capture snapshot.\n")
+            while True:
+                c, r, f, ts = cam.read_raw_filtered()
+                if c is not None and r is not None:
+                    last_color = c
+                    last_depth = r
+                    h_c, w_c = c.shape[:2]
+                    scale = cam.depth_scale
+                    d_m = r.astype(np.float32) * (scale if cam.depth_units == "sensor_units" else 1.0)
+                    roi = d_m[int(0.25 * h_c) : int(0.75 * h_c), int(0.25 * w_c) : int(0.75 * w_c)]
+                    valid_roi = roi[(roi > 0.3) & (roi < 3.5)]
+                    med_depth_m = float(np.median(valid_roi)) if len(valid_roi) > 0 else None
+                    valid_frac = float(len(valid_roi)) / float(roi.size) if roi.size > 0 else 0.0
+
+                    snapshot = {
+                        "state": "PREVIEW_ONLY",
+                        "stop_index": 0,
+                        "n_stops": 1,
+                        "turn_direction": "cw",
+                        "orientation": args.portrait,
+                        "distance_m": med_depth_m,
+                        "valid_depth_pct": valid_frac * 100.0,
+                        "motion_mm": 0.0,
+                        "head_visible": True,
+                        "feet_visible": True,
+                        "burst_progress": 0.0,
+                        "last_rejection_reason": "Live Camera Check (Preview Mode)",
+                    }
+                    display_frame = render_frame(snapshot, c, f if f is not None else d_m)
+                    cv2.imshow(window_name, display_frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q"), 27):
+                    break
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+        else:
+            # Stream for approx 5 seconds or until frames acquired
+            start_time = time.time()
+            while (time.time() - start_time) < 5.0:
+                c, r, f, ts = cam.read_raw_filtered()
+                if c is not None and r is not None:
+                    last_color = c
+                    last_depth = r
+                time.sleep(0.033)
     finally:
         cam.stop()
 
