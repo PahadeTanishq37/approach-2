@@ -8,14 +8,14 @@ MediaPipePose backend, and robust 3D keypoint lifting via local depth window.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 import cv2
 import numpy as np
 import open3d as o3d
 
 from realsense_measure.fullbody.config import FullBodyConfig
-from realsense_measure.fullbody.types import Keypoints3D
+from realsense_measure.fullbody.types import AlignedStop, Keypoints3D
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ class MediaPipePoseDetector:
                         base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
                         options = vision.PoseLandmarkerOptions(
                             base_options=base_options,
-                            output_segmentation_masks=False,
+                            output_segmentation_masks=True,
                             min_pose_detection_confidence=0.3,
                             min_tracking_confidence=0.3,
                         )
@@ -101,14 +101,15 @@ class MediaPipePoseDetector:
             except Exception as exc:
                 logger.warning(f"  [keypoints] Could not initialize MediaPipe Pose: {exc}")
 
-    def detect(
+    def detect_with_mask(
         self, color_bgr: np.ndarray
-    ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float], Dict[str, float]]:
+    ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float], Dict[str, float], Optional[np.ndarray]]:
         self._ensure_initialized()
         h, w = color_bgr.shape[:2]
         pts_2d: Dict[str, Tuple[float, float]] = {}
         conf_dict: Dict[str, float] = {}
         vis_dict: Dict[str, float] = {}
+        person_mask: Optional[np.ndarray] = None
 
         mp_indices = {
             "nose": 0,
@@ -130,8 +131,11 @@ class MediaPipePoseDetector:
                 rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 results = self._landmarker.detect(mp_image)
+                if getattr(results, "segmentation_masks", None):
+                    seg = results.segmentation_masks[0].numpy_view().squeeze()
+                    person_mask = (seg > 0.4).astype(bool)
                 if not results.pose_landmarks:
-                    return pts_2d, conf_dict, vis_dict
+                    return pts_2d, conf_dict, vis_dict, person_mask
                 landmarks = results.pose_landmarks[0]
                 for name, idx in mp_indices.items():
                     lm = landmarks[idx]
@@ -142,14 +146,16 @@ class MediaPipePoseDetector:
                     vis_dict[name] = float(getattr(lm, "visibility", 1.0))
             except Exception as exc:
                 logger.debug(f"  [keypoints] Tasks pose detection error: {exc}")
-            return pts_2d, conf_dict, vis_dict
+            return pts_2d, conf_dict, vis_dict, person_mask
 
         if self._pose is not None:
             try:
                 rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
                 results = self._pose.process(rgb)
+                if getattr(results, "segmentation_mask", None) is not None:
+                    person_mask = (results.segmentation_mask > 0.4).astype(bool)
                 if not results.pose_landmarks:
-                    return pts_2d, conf_dict, vis_dict
+                    return pts_2d, conf_dict, vis_dict, person_mask
 
                 for name, idx in mp_indices.items():
                     lm = results.pose_landmarks.landmark[idx]
@@ -162,6 +168,12 @@ class MediaPipePoseDetector:
             except Exception as exc:
                 logger.debug(f"  [keypoints] Solutions pose detection error: {exc}")
 
+        return pts_2d, conf_dict, vis_dict, person_mask
+
+    def detect(
+        self, color_bgr: np.ndarray
+    ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float], Dict[str, float]]:
+        pts_2d, conf_dict, vis_dict, _ = self.detect_with_mask(color_bgr)
         return pts_2d, conf_dict, vis_dict
 
 
@@ -183,6 +195,7 @@ def lift_keypoints_to_3d(
     fx, fy = intrinsics.get_focal_length()
     cx, cy = intrinsics.get_principal_point()
     win = cfg.keypoint_window_size_px
+    margin = 15
 
     names: List[str] = []
     points_3d: List[List[float]] = []
@@ -190,6 +203,14 @@ def lift_keypoints_to_3d(
     vis_3d: List[float] = []
 
     for name, (u_f, v_f) in pts_2d.items():
+        # Reject landmarks placed right on image boundaries (truncated anatomy / edge artifacts)
+        if u_f < margin or u_f > (w - 1 - margin) or v_f < margin or v_f > (h - 1 - margin):
+            names.append(name)
+            points_3d.append([0.0, 0.0, 0.0])
+            conf_3d.append(0.0)
+            vis_3d.append(0.0)
+            continue
+
         u_int = int(round(u_f))
         v_int = int(round(v_f))
 
@@ -302,4 +323,116 @@ def average_burst_keypoints_2d(
         avg_vis[name] = float(np.mean(joint_vis[name]))
 
     return avg_pts, avg_confs, avg_vis
+
+
+def aggregate_canonical_keypoints(
+    aligned_stops: List[AlignedStop],
+    cfg: FullBodyConfig,
+) -> Optional[Keypoints3D]:
+    """
+    Robustly aggregate 3D skeletal keypoints across multiple aligned stops into canonical frame.
+    Uses confidence-weighted robust median pooling with outlier rejection (>15cm).
+    """
+    if not aligned_stops:
+        return None
+
+    raw_obs_by_name: Dict[str, List[Tuple[int, np.ndarray, float, float]]] = {}
+    provenance_by_name: Dict[str, Dict[str, Any]] = {}
+
+    for a in aligned_stops:
+        if not a.accepted or a.keypoints_canonical is None:
+            continue
+        kpts = a.keypoints_canonical
+        if kpts.frame != "canonical":
+            logger.warning(
+                f"  [keypoints] Stop {a.stop_id} keypoints frame '{kpts.frame}' incompatible with 'canonical'; rejected."
+            )
+            continue
+
+        for name, pt, conf, vis in zip(kpts.names, kpts.points, kpts.confidence, kpts.visibility):
+            prov = provenance_by_name.setdefault(name, {"supporting_views": [], "rejected_views": []})
+            c_val = float(conf)
+            v_val = float(vis)
+            if np.allclose(pt, 0.0) or np.isnan(pt).any():
+                prov["rejected_views"].append({"stop_id": a.stop_id, "reason": "missing_or_clipped"})
+                continue
+            if c_val < 0.20 or v_val < 0.20:
+                prov["rejected_views"].append({"stop_id": a.stop_id, "reason": f"low_confidence_{c_val:.2f}"})
+                continue
+
+            raw_obs_by_name.setdefault(name, []).append((a.stop_id, pt, c_val, v_val))
+
+    if not raw_obs_by_name:
+        return None
+
+    agg_names: List[str] = []
+    agg_points: List[np.ndarray] = []
+    agg_conf: List[float] = []
+    agg_vis: List[float] = []
+
+    for name, obs_list in raw_obs_by_name.items():
+        stop_ids = [o[0] for o in obs_list]
+        pts_arr = np.array([o[1] for o in obs_list], dtype=np.float32)
+        confs = np.array([o[2] for o in obs_list], dtype=np.float32)
+        viss = np.array([o[3] for o in obs_list], dtype=np.float32)
+        prov = provenance_by_name.setdefault(name, {"supporting_views": [], "rejected_views": []})
+
+        if len(pts_arr) == 1:
+            agg_names.append(name)
+            agg_points.append(pts_arr[0])
+            agg_conf.append(float(confs[0]))
+            agg_vis.append(float(viss[0]))
+            prov["supporting_views"].append({"stop_id": stop_ids[0], "weight": 1.0, "distance_to_median_m": 0.0})
+            continue
+
+        # Compute median position
+        med_pt = np.median(pts_arr, axis=0)
+        # Euclidean distances to median
+        dists = np.linalg.norm(pts_arr - med_pt, axis=1)
+        inlier_mask = dists <= 0.15  # 15 cm threshold for pose consistency across views
+
+        if np.any(inlier_mask):
+            inlier_pts = pts_arr[inlier_mask]
+            inlier_confs = confs[inlier_mask]
+            inlier_vis = viss[inlier_mask]
+            inlier_stop_ids = [stop_ids[i] for i in range(len(stop_ids)) if inlier_mask[i]]
+            rejected_stop_ids = [stop_ids[i] for i in range(len(stop_ids)) if not inlier_mask[i]]
+
+            for r_id in rejected_stop_ids:
+                prov["rejected_views"].append({"stop_id": r_id, "reason": "outlier_gt_15cm"})
+
+            weight_sum = np.sum(inlier_confs)
+            if weight_sum > 1e-6:
+                weights = inlier_confs / weight_sum
+                weighted_pt = np.sum(inlier_pts * inlier_confs[:, np.newaxis], axis=0) / weight_sum
+            else:
+                weights = np.ones(len(inlier_pts)) / len(inlier_pts)
+                weighted_pt = np.median(inlier_pts, axis=0)
+
+            for s_id, w_val, d_val in zip(inlier_stop_ids, weights, dists[inlier_mask]):
+                prov["supporting_views"].append({"stop_id": s_id, "weight": float(w_val), "distance_to_median_m": float(d_val)})
+
+            agg_names.append(name)
+            agg_points.append(weighted_pt)
+            agg_conf.append(float(np.mean(inlier_confs)))
+            agg_vis.append(float(np.mean(inlier_vis)))
+        else:
+            for s_id, d_val in zip(stop_ids, dists):
+                prov["supporting_views"].append({"stop_id": s_id, "weight": 1.0 / len(stop_ids), "distance_to_median_m": float(d_val)})
+            agg_names.append(name)
+            agg_points.append(med_pt)
+            agg_conf.append(float(np.mean(confs) * 0.5))
+            agg_vis.append(float(np.mean(viss) * 0.5))
+
+    agg_kpts = Keypoints3D(
+        names=agg_names,
+        points=np.array(agg_points, dtype=np.float32) if agg_points else np.zeros((0, 3), dtype=np.float32),
+        confidence=np.array(agg_conf, dtype=np.float32) if agg_conf else np.zeros((0,), dtype=np.float32),
+        visibility=np.array(agg_vis, dtype=np.float32) if agg_vis else np.zeros((0,), dtype=np.float32),
+        frame="canonical",
+        metadata={"provenance": provenance_by_name},
+    )
+    _add_derived_midpoints(agg_kpts)
+    return agg_kpts
+
 

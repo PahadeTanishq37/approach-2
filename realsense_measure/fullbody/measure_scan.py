@@ -100,6 +100,7 @@ def measure_fused_scan(
     cfg: FullBodyConfig,
     crown_clipped_in_camera: bool = False,
     hole_map: Optional[Dict[str, float]] = None,
+    floor_observed: bool = True,
 ) -> Dict[str, MeasurementResult]:
     """
     Extract all anthropometric measurements from the canonical fused point cloud.
@@ -119,57 +120,79 @@ def measure_fused_scan(
         labels = label_points_by_body_part(pts, keypoints, cfg)
 
     # 3. Stature
-    y_floor = levels.get("floor", 0.0)
-    y_crown = levels.get("crown", float(np.percentile(pts[:, 1], 99.95)))
-    stature_mm = (y_crown - y_floor) * 1000.0
-
-    crown_hole = hole_map.get("crown", 0.0) if hole_map is not None else 0.0
-    if crown_clipped_in_camera:
-        stature_flag = QualityFlag.PARTIAL.value
-        stature_notes = "crown_clipped (top of head touched camera FOV boundary)"
-        stature_cov = 0.85
-    elif crown_hole > cfg.crown_hole_threshold:
-        stature_flag = QualityFlag.PARTIAL.value
-        stature_notes = (
-            f"crown_unobserved (missing fraction {crown_hole:.2f} > {cfg.crown_hole_threshold:.2f} "
-            f"due to camera viewing horizon)"
+    if not floor_observed:
+        results["stature"] = MeasurementResult(
+            name="stature",
+            value_mm=float("nan"),
+            method="vertical_height",
+            coverage=0.0,
+            interpolated_fraction=0.0,
+            quality_flag=QualityFlag.NOT_MEASURABLE.value,
+            uncertainty_mm=0.0,
+            notes="floor_unobserved (no consistent floor planes observed across stops; lower body unobserved)",
         )
-        stature_cov = float(max(0.0, 1.0 - crown_hole))
-    else:
-        stature_flag = QualityFlag.OK.value
-        stature_notes = ""
-        stature_cov = 1.0
-
-    results["stature"] = MeasurementResult(
-        name="stature",
-        value_mm=stature_mm,
-        method="vertical_height",
-        coverage=stature_cov,
-        interpolated_fraction=0.0,
-        quality_flag=stature_flag,
-        uncertainty_mm=3.0,
-        notes=stature_notes,
-    )
-
-    # 3b. Head-fit crown estimation (secondary stature estimate via sphere fit strictly above neck)
-    apex_hf_y, apex_hf_unc_mm, r_fit_mm, res_rms_mm = estimate_crown_by_head_fit(
-        pts, cfg, levels.get("neck_base")
-    )
-    if not math.isnan(apex_hf_y):
-        stature_hf_mm = (apex_hf_y - y_floor) * 1000.0
         results["stature_head_fit"] = MeasurementResult(
             name="stature_head_fit",
-            value_mm=stature_hf_mm,
+            value_mm=float("nan"),
             method="head_sphere_fit",
+            coverage=0.0,
+            interpolated_fraction=0.0,
+            quality_flag=QualityFlag.NOT_MEASURABLE.value,
+            uncertainty_mm=0.0,
+            notes="floor_unobserved (no consistent floor planes observed across stops; lower body unobserved)",
+        )
+    else:
+        y_floor = levels.get("floor", 0.0)
+        y_crown = levels.get("crown", float(np.percentile(pts[:, 1], 99.95)))
+        stature_mm = (y_crown - y_floor) * 1000.0
+
+        crown_hole = hole_map.get("crown", 0.0) if hole_map is not None else 0.0
+        if crown_clipped_in_camera:
+            stature_flag = QualityFlag.PARTIAL.value
+            stature_notes = "crown_clipped (top of head touched camera FOV boundary)"
+            stature_cov = 0.85
+        elif crown_hole > cfg.crown_hole_threshold:
+            stature_flag = QualityFlag.PARTIAL.value
+            stature_notes = (
+                f"crown_unobserved (missing fraction {crown_hole:.2f} > {cfg.crown_hole_threshold:.2f} "
+                f"due to camera viewing horizon)"
+            )
+            stature_cov = float(max(0.0, 1.0 - crown_hole))
+        else:
+            stature_flag = QualityFlag.OK.value
+            stature_notes = ""
+            stature_cov = 1.0
+
+        results["stature"] = MeasurementResult(
+            name="stature",
+            value_mm=stature_mm,
+            method="vertical_height",
             coverage=stature_cov,
             interpolated_fraction=0.0,
             quality_flag=stature_flag,
-            uncertainty_mm=max(apex_hf_unc_mm, 3.0),
-            notes=(
-                f"stature from sphere fit to cranium above neck (y>={levels.get('neck_base', 0.0)+0.02:.2f}m); "
-                f"r_fit={r_fit_mm:.1f}mm, residual_rms={res_rms_mm:.1f}mm"
-            ),
+            uncertainty_mm=3.0,
+            notes=stature_notes,
         )
+
+        # 3b. Head-fit crown estimation (secondary stature estimate via sphere fit strictly above neck)
+        apex_hf_y, apex_hf_unc_mm, r_fit_mm, res_rms_mm = estimate_crown_by_head_fit(
+            pts, cfg, levels.get("neck_base")
+        )
+        if not math.isnan(apex_hf_y):
+            stature_hf_mm = (apex_hf_y - y_floor) * 1000.0
+            results["stature_head_fit"] = MeasurementResult(
+                name="stature_head_fit",
+                value_mm=stature_hf_mm,
+                method="head_sphere_fit",
+                coverage=stature_cov,
+                interpolated_fraction=0.0,
+                quality_flag=stature_flag,
+                uncertainty_mm=max(apex_hf_unc_mm, 3.0),
+                notes=(
+                    f"stature from sphere fit to cranium above neck (y>={levels.get('neck_base', 0.0)+0.02:.2f}m); "
+                    f"r_fit={r_fit_mm:.1f}mm, residual_rms={res_rms_mm:.1f}mm"
+                ),
+            )
 
     # 4. Shoulder width and skeletal segment lengths from keypoints
     if keypoints is not None:
@@ -205,29 +228,110 @@ def _measure_skeletal_segments(
             notes="Euclidean distance between left and right acromion keypoints",
         )
 
-    # Segment lengths
-    segments = [
-        ("shoulder_elbow_length_left", "left_shoulder", "left_elbow"),
-        ("shoulder_elbow_length_right", "right_shoulder", "right_elbow"),
-        ("shoulder_wrist_length_left", "left_shoulder", "left_wrist"),
-        ("shoulder_wrist_length_right", "right_shoulder", "right_wrist"),
-        ("inseam_left", "left_hip", "left_ankle"),
-        ("inseam_right", "right_hip", "right_ankle"),
-    ]
-    for seg_name, j_a, j_b in segments:
-        pt_a, c_a, _ = keypoints.get(j_a)
-        pt_b, c_b, _ = keypoints.get(j_b)
-        if pt_a is not None and pt_b is not None and c_a >= 0.2 and c_b >= 0.2:
-            seg_len_mm = float(np.linalg.norm(pt_a - pt_b) * 1000.0)
-            results[seg_name] = MeasurementResult(
-                name=seg_name,
-                value_mm=seg_len_mm,
+    # Arm measurements (kinematic chain: shoulder->elbow + elbow->wrist)
+    for side in ("left", "right"):
+        sh, c_sh, _ = keypoints.get(f"{side}_shoulder")
+        el, c_el, _ = keypoints.get(f"{side}_elbow")
+        wr, c_wr, _ = keypoints.get(f"{side}_wrist")
+
+        # Upper arm: shoulder to elbow
+        se_len_mm = None
+        if sh is not None and el is not None and c_sh >= 0.2 and c_el >= 0.2:
+            se_len_mm = float(np.linalg.norm(sh - el) * 1000.0)
+            cov_se = float(min(c_sh, c_el))
+            results[f"shoulder_elbow_length_{side}"] = MeasurementResult(
+                name=f"shoulder_elbow_length_{side}",
+                value_mm=se_len_mm,
                 method="skeletal_keypoints",
-                coverage=float(min(c_a, c_b)),
+                coverage=cov_se,
                 interpolated_fraction=0.0,
-                quality_flag=QualityFlag.OK.value if min(c_a, c_b) > 0.5 else QualityFlag.PARTIAL.value,
+                quality_flag=QualityFlag.OK.value if cov_se > 0.5 else QualityFlag.PARTIAL.value,
+                uncertainty_mm=10.0,
+                notes=f"skeletal upper arm segment ({side})",
+            )
+
+        # Forearm: elbow to wrist
+        ew_len_mm = None
+        if el is not None and wr is not None and c_el >= 0.2 and c_wr >= 0.2:
+            ew_len_mm = float(np.linalg.norm(el - wr) * 1000.0)
+            cov_ew = float(min(c_el, c_wr))
+            results[f"elbow_wrist_length_{side}"] = MeasurementResult(
+                name=f"elbow_wrist_length_{side}",
+                value_mm=ew_len_mm,
+                method="skeletal_keypoints",
+                coverage=cov_ew,
+                interpolated_fraction=0.0,
+                quality_flag=QualityFlag.OK.value if cov_ew > 0.5 else QualityFlag.PARTIAL.value,
+                uncertainty_mm=10.0,
+                notes=f"skeletal forearm segment ({side})",
+            )
+
+        # Total arm length: kinematic sum
+        if se_len_mm is not None and ew_len_mm is not None:
+            arm_total_mm = se_len_mm + ew_len_mm
+            cov_arm = float(min(c_sh, c_el, c_wr))
+            results[f"arm_length_{side}"] = MeasurementResult(
+                name=f"arm_length_{side}",
+                value_mm=arm_total_mm,
+                method="kinematic_chain",
+                coverage=cov_arm,
+                interpolated_fraction=0.0,
+                quality_flag=QualityFlag.OK.value if cov_arm > 0.5 else QualityFlag.PARTIAL.value,
                 uncertainty_mm=12.0,
-                notes="skeletal segment distance (lower accuracy than tape)",
+                notes=f"kinematic chain sum: shoulder-elbow + elbow-wrist ({side})",
+            )
+
+        # Straight-line chord (for diagnostic comparison)
+        if sh is not None and wr is not None and c_sh >= 0.2 and c_wr >= 0.2:
+            chord_mm = float(np.linalg.norm(sh - wr) * 1000.0)
+            cov_ch = float(min(c_sh, c_wr))
+            results[f"shoulder_wrist_chord_{side}"] = MeasurementResult(
+                name=f"shoulder_wrist_chord_{side}",
+                value_mm=chord_mm,
+                method="skeletal_chord",
+                coverage=cov_ch,
+                interpolated_fraction=0.0,
+                quality_flag=QualityFlag.OK.value if cov_ch > 0.5 else QualityFlag.PARTIAL.value,
+                uncertainty_mm=15.0,
+                notes="direct shoulder-wrist chord (bent arm will measure shorter than kinematic length)",
+            )
+            # Retain legacy key shoulder_wrist_length for backwards compatibility
+            results[f"shoulder_wrist_length_{side}"] = results[f"shoulder_wrist_chord_{side}"]
+
+    # Inseam / leg segments
+    for side in ("left", "right"):
+        hp, c_hp, _ = keypoints.get(f"{side}_hip")
+        kn, c_kn, _ = keypoints.get(f"{side}_knee")
+        ak, c_ak, _ = keypoints.get(f"{side}_ankle")
+
+        hk_len = float(np.linalg.norm(hp - kn) * 1000.0) if hp is not None and kn is not None and c_hp >= 0.2 and c_kn >= 0.2 else None
+        ka_len = float(np.linalg.norm(kn - ak) * 1000.0) if kn is not None and ak is not None and c_kn >= 0.2 and c_ak >= 0.2 else None
+
+        if hk_len is not None and ka_len is not None:
+            inseam_mm = hk_len + ka_len
+            cov_leg = float(min(c_hp, c_kn, c_ak))
+            results[f"inseam_{side}"] = MeasurementResult(
+                name=f"inseam_{side}",
+                value_mm=inseam_mm,
+                method="kinematic_chain",
+                coverage=cov_leg,
+                interpolated_fraction=0.0,
+                quality_flag=QualityFlag.OK.value if cov_leg > 0.5 else QualityFlag.PARTIAL.value,
+                uncertainty_mm=15.0,
+                notes=f"kinematic leg length: hip-knee + knee-ankle ({side})",
+            )
+        elif hp is not None and ak is not None and c_hp >= 0.2 and c_ak >= 0.2:
+            chord_mm = float(np.linalg.norm(hp - ak) * 1000.0)
+            cov_in = float(min(c_hp, c_ak))
+            results[f"inseam_{side}"] = MeasurementResult(
+                name=f"inseam_{side}",
+                value_mm=chord_mm,
+                method="skeletal_chord",
+                coverage=cov_in,
+                interpolated_fraction=0.0,
+                quality_flag=QualityFlag.OK.value if cov_in > 0.5 else QualityFlag.PARTIAL.value,
+                uncertainty_mm=15.0,
+                notes=f"direct hip-ankle chord ({side})",
             )
 
 
@@ -256,8 +360,9 @@ def extract_ring_circumference(
             # Points within trunk boundary (|X| <= 0.20m) are protected from arm labeling.
             is_arm = is_arm_point(labels) & (np.abs(points[:, 0]) > 0.20)
             slab_mask &= (~is_arm)
-        # Exclude extreme lateral points
+        # Exclude extreme lateral and anterior/posterior points (room walls and clutter)
         slab_mask &= (np.abs(points[:, 0]) < 0.28)
+        slab_mask &= (np.abs(points[:, 2]) < 0.35)
     else:
         # For limb rings, isolate limb from adjacent anatomy using limb-appropriate radial bounds
         limb_rad_max = 0.09 if "thigh" in plane.name else 0.07
@@ -290,6 +395,18 @@ def extract_ring_circumference(
     dv = v_2d - c_v
     angles = np.arctan2(dv, du)  # [-pi, pi]
     radii = np.sqrt(du ** 2 + dv ** 2)
+
+    # Filter radial outliers from centroid for trunk (human trunk radius from center never exceeds 32 cm)
+    if not plane.is_limb:
+        radial_inliers = radii <= 0.35
+        if np.sum(radial_inliers) >= min_pts_required:
+            pts_2d = pts_2d[radial_inliers]
+            u_2d = u_2d[radial_inliers]
+            v_2d = v_2d[radial_inliers]
+            du = du[radial_inliers]
+            dv = dv[radial_inliers]
+            angles = angles[radial_inliers]
+            radii = radii[radial_inliers]
 
     # 3. Bin into M angular sectors (torso uses dense bins; limbs use 36 bins matched to limb point spacing)
     M = cfg.num_angular_bins if not plane.is_limb else 36

@@ -327,7 +327,11 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
     logger.info(f"Processing {len(stops)} stops (keypoint detection, floor fitting, confidence map) ...")
     for s in stops:
         # 1. 2D keypoints and 3D lifting
-        pts_2d, conf_2d, vis_2d = detector.detect(s.color)
+        if hasattr(detector, "detect_with_mask"):
+            pts_2d, conf_2d, vis_2d, p_mask = detector.detect_with_mask(s.color)
+            s.person_mask = p_mask
+        else:
+            pts_2d, conf_2d, vis_2d = detector.detect(s.color)
         s.keypoints_camera = lift_keypoints_to_3d(pts_2d, conf_2d, vis_2d, s.depth, s.intrinsics, cfg)
 
         # 2. Floor plane
@@ -349,6 +353,18 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
         depth_m[depth_m > cfg.depth_max_m] = 0.0
         if s.confidence_map is not None:
             depth_m[s.confidence_map < cfg.min_confidence_threshold] = 0.0
+        if s.person_mask is not None:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            dilated_m = cv2.dilate(s.person_mask.astype(np.uint8), kernel).astype(bool)
+            core_depths = depth_m[s.person_mask & (depth_m > cfg.depth_min_m)]
+            if len(core_depths) > 50:
+                z_med = float(np.median(core_depths))
+                depth_consistent = (depth_m >= max(cfg.depth_min_m, z_med - 0.50)) & (
+                    depth_m <= min(cfg.depth_max_m, z_med + 0.50)
+                )
+                depth_m[~dilated_m | ~depth_consistent] = 0.0
+            else:
+                depth_m[~dilated_m] = 0.0
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(color_rgb),
             o3d.geometry.Image(depth_m),
@@ -358,10 +374,16 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
         )
         s.pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, s.intrinsics)
 
+    floor_observed = False
     if detected_floors:
         is_consistent, rep_floor = verify_floor_consistency(detected_floors, cfg)
-        if not is_consistent:
-            logger.warning("Floor planes across stops are not fully consistent; using consensus plane.")
+        if is_consistent and len(detected_floors) >= 3:
+            floor_observed = True
+        else:
+            logger.warning(
+                f"Floor planes across stops are insufficient ({len(detected_floors)} < 3) or inconsistent; "
+                f"floor marked as unobserved."
+            )
     else:
         logger.warning("No floor planes detected across stops; falling back to nominal gravity floor.")
         from realsense_measure.fullbody.types import FloorPlane
@@ -374,7 +396,7 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
             rmse_m=0.0,
             gravity_R_cam=np.eye(3),
         )
-    logger.info(f"Floor plane verification complete (normal={rep_floor.normal}, height={rep_floor.point_on_plane[1]:.3f} m).")
+    logger.info(f"Floor plane verification complete (observed={floor_observed}, normal={rep_floor.normal}, height={rep_floor.point_on_plane[1]:.3f} m).")
 
     # Alignment
     logger.info("Aligning multi-stop point clouds with joint prior and 4-DoF MAP-ICP ...")
@@ -386,8 +408,18 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
 
     # Anthropometric measurements
     logger.info("Extracting tape-style anthropometric measurements ...")
-    ref_kpts = aligned[0].keypoints_canonical if aligned else None
-    measurements = measure_fused_scan(fused_pcd, ref_kpts, cfg, hole_map=hole_map)
+    from realsense_measure.fullbody.keypoints import aggregate_canonical_keypoints
+    ref_kpts = aggregate_canonical_keypoints(aligned, cfg)
+    if ref_kpts is None and aligned:
+        ref_kpts = aligned[0].keypoints_canonical
+
+    measurements = measure_fused_scan(
+        fused_pcd,
+        ref_kpts,
+        cfg,
+        hole_map=hole_map,
+        floor_observed=floor_observed,
+    )
 
     subj_id = "subject_01"
     meta_p = Path(capture_dir) / "meta.json"

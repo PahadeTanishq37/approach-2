@@ -172,3 +172,97 @@ def test_stature_and_crown_clipped_flag():
     assert res_clipped["stature"].quality_flag == QualityFlag.PARTIAL.value
     assert "crown_clipped" in res_clipped["stature"].notes
 
+
+def test_floor_unobserved_rejects_stature():
+    """Verify that when floor is unobserved, stature is flagged NOT_MEASURABLE and NaN."""
+    cfg = FullBodyConfig()
+    pts = np.array([
+        [0.0, 0.5, 0.0],
+        [0.0, 1.2, 0.0],  # only upper body
+    ])
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+
+    res = measure_fused_scan(pcd, None, cfg, floor_observed=False)
+    assert res["stature"].quality_flag == QualityFlag.NOT_MEASURABLE.value
+    assert math.isnan(res["stature"].value_mm)
+    assert "floor_unobserved" in res["stature"].notes
+    assert res["stature_head_fit"].quality_flag == QualityFlag.NOT_MEASURABLE.value
+
+
+def test_kinematic_arm_length_consistency():
+    """Verify arm length is kinematic chain sum and correctly exceeds straight chord for bent arm."""
+    cfg = FullBodyConfig()
+    # Synthetic bent left arm (90 degree elbow bend):
+    # shoulder: (0.20, 1.40, 0.0)
+    # elbow:    (0.50, 1.40, 0.0) -> shoulder-elbow = 0.30 m
+    # wrist:    (0.50, 1.15, 0.0) -> elbow-wrist    = 0.25 m
+    # Direct chord = sqrt(0.30^2 + 0.25^2) = 0.3905 m (390.5 mm)
+    # Kinematic length = 0.30 + 0.25 = 0.55 m (550.0 mm)
+    kpts = Keypoints3D(
+        names=["left_shoulder", "left_elbow", "left_wrist"],
+        points=np.array([
+            [0.20, 1.40, 0.0],
+            [0.50, 1.40, 0.0],
+            [0.50, 1.15, 0.0],
+        ], dtype=np.float32),
+        confidence=np.array([0.9, 0.9, 0.9], dtype=np.float32),
+        visibility=np.array([0.9, 0.9, 0.9], dtype=np.float32),
+        frame="canonical",
+    )
+
+    pts = np.array([[0.0, 1.0, 0.0]])
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+
+    res = measure_fused_scan(pcd, kpts, cfg)
+
+    assert "arm_length_left" in res
+    assert "shoulder_elbow_length_left" in res
+    assert "elbow_wrist_length_left" in res
+    assert "shoulder_wrist_chord_left" in res
+
+    se_mm = res["shoulder_elbow_length_left"].value_mm
+    ew_mm = res["elbow_wrist_length_left"].value_mm
+    arm_mm = res["arm_length_left"].value_mm
+    chord_mm = res["shoulder_wrist_chord_left"].value_mm
+
+    assert np.isclose(se_mm, 300.0, atol=2.0)
+    assert np.isclose(ew_mm, 250.0, atol=2.0)
+    assert np.isclose(arm_mm, 550.0, atol=2.0)
+    assert np.isclose(chord_mm, 390.5, atol=2.0)
+    # Kinematic length must be strictly longer than chord for bent arm
+    assert arm_mm > chord_mm
+
+
+def test_torso_ring_rejects_background_wall_points():
+    """Verify that background wall points at Z=1.5m are excluded from waist/chest slicing."""
+    cfg = FullBodyConfig(slice_thickness_m=0.03)
+
+    # Torso ring (radius 0.15m circle at Y=1.0)
+    angles = np.linspace(0, 2 * math.pi, 200, endpoint=False)
+    torso_pts = np.stack([0.15 * np.cos(angles), np.full(200, 1.0), 0.15 * np.sin(angles)], axis=1)
+
+    # Extraneous wall points at Z = 1.5 m
+    wall_pts = np.array([
+        [0.0, 1.0, 1.5],
+        [0.1, 1.0, 1.5],
+        [-0.1, 1.0, 1.5],
+    ])
+    all_pts = np.vstack([torso_pts, wall_pts])
+
+    plane = SlicingPlane(
+        name="waist",
+        origin=np.array([0.0, 1.0, 0.0]),
+        normal=np.array([0.0, 1.0, 0.0]),
+        u_axis=np.array([1.0, 0.0, 0.0]),
+        v_axis=np.array([0.0, 0.0, 1.0]),
+        is_limb=False,
+    )
+
+    res_polar, res_hull = extract_ring_circumference(all_pts, plane, None, cfg)
+
+    # Torso circle perimeter ~ 942.5 mm; if wall was included, hull would be > 2000 mm
+    expected_circle_mm = 2 * math.pi * 0.15 * 1000.0
+    assert abs(res_hull.value_mm - expected_circle_mm) < 30.0
+    assert res_hull.value_mm < 1100.0
+
+

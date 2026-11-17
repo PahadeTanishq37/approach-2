@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import open3d as o3d
 
@@ -51,6 +52,20 @@ def fuse_aligned_stops(
         depth = s.depth.copy()
         if s.confidence_map is not None:
             depth[s.confidence_map < cfg.min_confidence_threshold] = 0.0
+        if s.person_mask is not None:
+            # Dilate person mask to preserve outer silhouettes and hair while rejecting walls
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            dilated = cv2.dilate(s.person_mask.astype(np.uint8), kernel).astype(bool)
+            core_depths = depth[s.person_mask & (depth > cfg.depth_min_m)]
+            if len(core_depths) > 50:
+                z_med = float(np.median(core_depths))
+                # Accept depth within 0.50 m of subject depth to exclude background room walls
+                depth_consistent = (depth >= max(cfg.depth_min_m, z_med - 0.50)) & (
+                    depth <= min(cfg.depth_max_m, z_med + 0.50)
+                )
+                depth[~dilated | ~depth_consistent] = 0.0
+            else:
+                depth[~dilated] = 0.0
 
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         color_o3d = o3d.geometry.Image(color_rgb.astype(np.uint8))
@@ -101,6 +116,18 @@ def fuse_aligned_stops(
                 depth = s.depth.copy()
                 if s.confidence_map is not None:
                     depth[s.confidence_map < cfg.min_confidence_threshold] = 0.0
+                if s.person_mask is not None:
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                    dilated = cv2.dilate(s.person_mask.astype(np.uint8), kernel).astype(bool)
+                    core_depths = depth[s.person_mask & (depth > cfg.depth_min_m)]
+                    if len(core_depths) > 50:
+                        z_med = float(np.median(core_depths))
+                        depth_consistent = (depth >= max(cfg.depth_min_m, z_med - 0.50)) & (
+                            depth <= min(cfg.depth_max_m, z_med + 0.50)
+                        )
+                        depth[~dilated | ~depth_consistent] = 0.0
+                    else:
+                        depth[~dilated] = 0.0
                 depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
                 color_o3d = o3d.geometry.Image(color_rgb.astype(np.uint8))
                 rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(

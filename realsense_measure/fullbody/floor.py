@@ -123,6 +123,15 @@ def fit_floor_plane(
     dist_to_plane = np.dot(point_on_plane, normal) + d
     point_on_plane -= dist_to_plane * normal
 
+    # In camera optical frame (+Y downwards), the floor must be well below the camera.
+    # An elevated surface (table, desk, box) with point_on_plane[1] < 0.50 m is rejected.
+    if point_on_plane[1] < 0.50:
+        logger.warning(
+            f"  [floor] Fitted plane is elevated (Y={point_on_plane[1]:.2f} m < 0.50 m below camera); "
+            f"rejected as table/desk/elevated surface."
+        )
+        return None
+
     rmse = float(np.sqrt(np.mean((inlier_pts @ normal + d) ** 2)))
     inlier_ratio = float(len(inliers) / len(pts))
 
@@ -180,6 +189,7 @@ def compute_rotation_aligning_vectors(
 def verify_floor_consistency(
     planes: List[FloorPlane],
     cfg: FullBodyConfig,
+    min_planes: int = 2,
 ) -> Tuple[bool, FloorPlane]:
     """
     Verify that floor planes detected across stops agree on orientation and height.
@@ -202,8 +212,12 @@ def verify_floor_consistency(
     angles_deg = np.rad2deg(np.arccos(dots))
     max_angle_diff = float(np.max(angles_deg))
 
-    is_consistent = max_angle_diff <= cfg.floor_max_angle_diff_deg
-    if not is_consistent:
+    is_consistent = (max_angle_diff <= cfg.floor_max_angle_diff_deg) and (len(planes) >= min_planes)
+    if len(planes) < min_planes:
+        logger.warning(
+            f"  [floor] Insufficient floor detections across stops ({len(planes)} < {min_planes}); floor consistency rejected."
+        )
+    elif not is_consistent:
         logger.warning(
             f"  [floor] Floor normals across stops differ by up to {max_angle_diff:.2f} deg "
             f"(threshold: {cfg.floor_max_angle_diff_deg:.1f} deg)"

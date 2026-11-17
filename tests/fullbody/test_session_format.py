@@ -378,3 +378,50 @@ def test_missing_depth_storage_metadata_raises():
         with pytest.raises(ValueError, match="missing required 'depth_storage'"):
             load_capture_session(root, cfg)
 
+
+def test_stops_v2_burst_processing_not_bypassed():
+    """Verify that multi-frame burst processing is executed and not bypassed even if filtered_depth.npy exists."""
+    intrinsics = {
+        "width": 80,
+        "height": 100,
+        "fx": 100.0,
+        "fy": 100.0,
+        "cx": 40.0,
+        "cy": 50.0,
+    }
+    dummy_color = np.full((100, 80, 3), 150, dtype=np.uint8)
+    burst_depths = [
+        np.full((100, 80), 1.20 + 0.01 * (i % 3 - 1), dtype=np.float32)
+        for i in range(5)
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "sess_burst"
+        writer = SessionWriter(
+            root=root,
+            subject_id="SUBJ_TEST",
+            n_stops=1,
+            turn_direction="cw",
+            camera_portrait_rotation="cw",
+            intrinsics=intrinsics,
+            depth_scale=0.001,
+        )
+        h = writer.begin_attempt(0)
+        writer.write_burst(h, [dummy_color] * 5, burst_depths)
+        # Write a rogue filtered_depth.npy that contains 0.40m
+        attempt_dir = root / "stop_00" / "attempt_00"
+        rogue_filtered = np.full((100, 80), 0.40, dtype=np.float32)
+        np.save(str(attempt_dir / "filtered_depth.npy"), rogue_filtered)
+
+        writer.finish_attempt(h, accepted=True)
+        writer.finalize()
+
+        cfg = FullBodyConfig()
+        stops = load_capture_session(root, cfg)
+        assert len(stops) == 1
+        # The fused depth must be computed from the burst (approx 1.20m), NOT the rogue 0.40m
+        assert np.isclose(np.mean(stops[0].depth), 1.20, atol=0.05)
+        assert stops[0].depth_std is not None
+        assert np.mean(stops[0].depth_std) > 0.001
+
+

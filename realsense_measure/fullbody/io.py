@@ -220,13 +220,18 @@ def _load_stops_v2(
             d_m = raw_d.astype(np.float32) * storage_scale
             burst_depths.append(d_m)
 
-        # Check if pre-filtered depth was written to attempt directory
+        # Process multi-frame burst with temporal median, standard deviation, and noise filtering.
+        # Do not bypass burst processing simply because a single filtered_depth.npy frame exists.
         filtered_path = attempt_dir / "filtered_depth.npy"
-        if filtered_path.exists():
-            rep_color = burst_colors[len(burst_colors) // 2]
+        if len(burst_depths) > 1:
+            rep_color, fused_depth, depth_std, valid_counts = process_stop_burst(
+                burst_colors, burst_depths, cfg
+            )
+        elif filtered_path.exists():
+            rep_color = burst_colors[0]
             fused_depth = np.load(str(filtered_path)).astype(np.float32)
             depth_std = np.zeros_like(fused_depth)
-            valid_counts = np.full_like(fused_depth, len(burst_depths), dtype=np.int32)
+            valid_counts = np.ones_like(fused_depth, dtype=np.int32)
         else:
             rep_color, fused_depth, depth_std, valid_counts = process_stop_burst(
                 burst_colors, burst_depths, cfg

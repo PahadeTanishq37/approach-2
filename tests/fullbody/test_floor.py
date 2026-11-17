@@ -83,7 +83,7 @@ def test_cross_stop_floor_consistency():
         rmse_m=0.005,
     )
 
-    consistent, consensus = verify_floor_consistency([p1, p2], cfg)
+    consistent, consensus = verify_floor_consistency([p1, p2], cfg, min_planes=2)
     assert consistent is True
     assert consensus.normal[1] < -0.99
 
@@ -98,6 +98,69 @@ def test_cross_stop_floor_consistency():
         inlier_ratio=0.8,
         rmse_m=0.005,
     )
-    consistent_bad, _ = verify_floor_consistency([p1, p3], cfg)
+    consistent_bad, _ = verify_floor_consistency([p1, p3], cfg, min_planes=2)
     assert consistent_bad is False
+
+
+def test_floor_rejection_for_wall_and_elevated_desk():
+    """Verify that vertical walls and elevated horizontal surfaces (desks) are rejected."""
+    h, w = 120, 160
+    intrinsics = o3d.camera.PinholeCameraIntrinsic(w, h, 100.0, 100.0, 80.0, 60.0)
+    cfg = FullBodyConfig(floor_lower_image_fraction=0.40, depth_min_m=0.3, depth_max_m=3.0)
+
+    # 1. Vertical wall: constant depth Z = 1.5 m across all lower pixels
+    wall_depth = np.zeros((h, w), dtype=np.float32)
+    wall_depth[int(h * 0.6):, :] = 1.50
+    floor_wall = fit_floor_plane(wall_depth, intrinsics, cfg)
+    assert floor_wall is None, "Vertical wall must not be accepted as a floor plane"
+
+    # 2. Elevated horizontal plane (e.g. desk at Y_cam = 0.20 m, < 0.50 m below camera)
+    desk_depth = np.zeros((h, w), dtype=np.float32)
+    cy, fy = 60.0, 100.0
+    for v in range(int(h * 0.6), h):
+        z_val = (0.20 * fy) / max(1.0, float(v - cy))
+        if 0.4 <= z_val <= 2.5:
+            desk_depth[v, :] = z_val
+
+    floor_desk = fit_floor_plane(desk_depth, intrinsics, cfg)
+    assert floor_desk is None, "Elevated plane at Y=0.20m (< 0.50m) must be rejected as floor"
+
+
+def test_insufficient_or_unobserved_floor_consistency():
+    """Verify verify_floor_consistency enforces min_planes >= 3 for multi-stop scans."""
+    cfg = FullBodyConfig()
+    n_up = np.array([0.0, -1.0, 0.0])
+    p1 = FloorPlane(
+        coefficients=np.array([0.0, -1.0, 0.0, 0.90]),
+        normal=n_up,
+        point_on_plane=np.array([0.0, 0.90, 1.2]),
+        inlier_count=500,
+        inlier_ratio=0.8,
+        rmse_m=0.005,
+    )
+    p2 = FloorPlane(
+        coefficients=np.array([0.0, -1.0, 0.0, 0.90]),
+        normal=n_up,
+        point_on_plane=np.array([0.0, 0.90, 1.2]),
+        inlier_count=500,
+        inlier_ratio=0.8,
+        rmse_m=0.005,
+    )
+    # Only 2 planes with min_planes=3
+    consistent_2, _ = verify_floor_consistency([p1, p2], cfg, min_planes=3)
+    assert consistent_2 is False, "Fewer than 3 floor detections must not satisfy multi-stop consistency"
+
+    p3 = FloorPlane(
+        coefficients=np.array([0.0, -1.0, 0.0, 0.90]),
+        normal=n_up,
+        point_on_plane=np.array([0.0, 0.90, 1.2]),
+        inlier_count=500,
+        inlier_ratio=0.8,
+        rmse_m=0.005,
+    )
+    # 3 planes with min_planes=3
+    consistent_3, consensus = verify_floor_consistency([p1, p2, p3], cfg, min_planes=3)
+    assert consistent_3 is True
+    assert consensus is not None
+
 

@@ -41,6 +41,7 @@ class FloorPlane:
     inlier_ratio: float = 0.0
     rmse_m: float = 0.0
     gravity_R_cam: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
+    is_observed: bool = True
 
 
 @dataclass
@@ -55,6 +56,7 @@ class Keypoints3D:
     confidence: np.ndarray  # shape (K,), float32 in [0, 1]
     visibility: np.ndarray  # shape (K,), float32 in [0, 1]
     frame: str = "camera"   # "camera", "gravity", or "canonical"
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def get(self, name: str) -> Tuple[Optional[np.ndarray], float, float]:
         """Return (3D point, confidence, visibility) for named joint or (None, 0.0, 0.0)."""
@@ -72,6 +74,7 @@ class Keypoints3D:
                 confidence=self.confidence.copy(),
                 visibility=self.visibility.copy(),
                 frame=new_frame,
+                metadata=dict(self.metadata),
             )
         R = T[:3, :3]
         t = T[:3, 3]
@@ -82,6 +85,7 @@ class Keypoints3D:
             confidence=self.confidence.copy(),
             visibility=self.visibility.copy(),
             frame=new_frame,
+            metadata=dict(self.metadata),
         )
 
 
