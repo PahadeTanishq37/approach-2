@@ -121,10 +121,12 @@ def render_frame(
     instr_x = max(w + 5, comp_w - txt_w - 15)
     cv2.putText(composite, instr_text, (instr_x, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-    # Active orientation indicator (e.g. Orientation: PORTRAIT CCW)
+    # Active orientation indicator (e.g. Orientation: PORTRAIT CCW or LANDSCAPE)
     orient = str(state_snapshot.get("orientation", "")).strip().lower()
     if orient in ("cw", "ccw"):
         orient_text = f"Orientation: PORTRAIT {orient.upper()}"
+    elif orient == "none":
+        orient_text = "Orientation: LANDSCAPE"
     elif orient:
         orient_text = f"Orientation: {orient.upper()}"
     else:

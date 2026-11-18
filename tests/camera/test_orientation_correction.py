@@ -254,36 +254,44 @@ def test_both_rotation_directions_supported():
 
 
 def test_cli_parser_orientation_defaults_and_preview_flags():
-    """Verify CLI parser defaults --portrait to ccw and provides preview flags."""
+    """Verify CLI parser defaults --portrait to 'none' (landscape) and provides preview flags."""
     from realsense_measure.fullbody.cli import build_parser
 
     parser = build_parser()
 
-    # 1. capture subcommand
+    # 1. capture subcommand — default is now 'none' (landscape/horizontal mount)
     cap_args = parser.parse_args(["capture", "--out", "test_out", "--subject-id", "TEST_01"])
-    assert cap_args.portrait == "ccw", f"Default portrait for capture should be 'ccw', got {cap_args.portrait}"
+    assert cap_args.portrait == "none", f"Default portrait for capture should be 'none', got {cap_args.portrait}"
     assert cap_args.preview_only is False
+
+    # Explicit ccw still works
+    cap_ccw_args = parser.parse_args(["capture", "--out", "test_out", "--subject-id", "TEST_01", "--portrait", "ccw"])
+    assert cap_ccw_args.portrait == "ccw"
 
     cap_preview_args = parser.parse_args(
         ["capture", "--out", "test_out", "--subject-id", "TEST_01", "--preview-only"]
     )
     assert cap_preview_args.preview_only is True
 
-    # 2. check-camera subcommand
+    # 2. check-camera subcommand — default is 'none' (landscape)
     chk_args = parser.parse_args(["check-camera"])
-    assert chk_args.portrait == "ccw", f"Default portrait for check-camera should be 'ccw', got {chk_args.portrait}"
+    assert chk_args.portrait == "none", f"Default portrait for check-camera should be 'none', got {chk_args.portrait}"
     assert chk_args.preview is False
 
     chk_preview_args = parser.parse_args(["check-camera", "--preview"])
     assert chk_preview_args.preview is True
 
+    # 3. 'none' is a valid choice
+    chk_none_args = parser.parse_args(["check-camera", "--portrait", "none"])
+    assert chk_none_args.portrait == "none"
+
 
 def test_hud_orientation_indicator_rendering():
-    """Verify render_frame correctly handles and renders active portrait orientation."""
+    """Verify render_frame correctly handles portrait and landscape orientation labels."""
     from realsense_measure.fullbody.capture_ui import render_frame
 
-    color = np.zeros((848, 480, 3), dtype=np.uint8)
-    depth = np.ones((848, 480), dtype=np.float32) * 1.5
+    color = np.zeros((480, 848, 3), dtype=np.uint8)
+    depth = np.ones((480, 848), dtype=np.float32) * 1.5
 
     # CCW snapshot
     snapshot_ccw = {
@@ -294,15 +302,15 @@ def test_hud_orientation_indicator_rendering():
         "orientation": "ccw",
     }
     rendered_ccw = render_frame(snapshot_ccw, color, depth)
-    assert rendered_ccw.shape == (848, 960, 3)
+    assert rendered_ccw.shape == (480, 1696, 3)
 
-    # CW snapshot
-    snapshot_cw = {
+    # Landscape ('none') snapshot
+    snapshot_landscape = {
         "state": "PREVIEW_ONLY",
         "stop_index": 0,
         "n_stops": 1,
         "turn_direction": "cw",
-        "orientation": "cw",
+        "orientation": "none",
     }
-    rendered_cw = render_frame(snapshot_cw, color, depth)
-    assert rendered_cw.shape == (848, 960, 3)
+    rendered_landscape = render_frame(snapshot_landscape, color, depth)
+    assert rendered_landscape.shape == (480, 1696, 3)

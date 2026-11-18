@@ -39,13 +39,13 @@ def full_body_camera_config(
     - use_decimation = False: Decimation reduces spatial resolution by half (424x240) and degrades
       fine anatomical contours and circumference estimation. Keeping decimation OFF preserves
       full native resolution (848x480) and 1:1 pixel correspondence.
-    - rotate_90 = portrait_rotation ('cw' or 'ccw'): Required for portrait tripod mounting to
-      orient the camera's wide FOV vertically, covering a full standing humanoid from crown to floor.
+    - rotate_90 = portrait_rotation ('cw', 'ccw', or 'none'): Set to 'none' for horizontal/landscape
+      camera mounting (native 848x480 frame used without any rotation).
     - fps = 30: Standard frame rate providing good temporal integration and SNR during burst capture.
     """
     rot = str(portrait_rotation).lower()
-    if rot not in ("cw", "ccw"):
-        raise ValueError(f"Invalid portrait_rotation '{portrait_rotation}'. Must be 'cw' or 'ccw'.")
+    if rot not in ("cw", "ccw", "none"):
+        raise ValueError(f"Invalid portrait_rotation '{portrait_rotation}'. Must be 'cw', 'ccw', or 'none'.")
 
     # Parse resolution string (e.g. "848x480")
     if "x" in resolution:
@@ -61,7 +61,7 @@ def full_body_camera_config(
         depth_min_m=0.30,
         depth_max_m=3.00,
         use_decimation=False,  # Strictly OFF to preserve full resolution geometry
-        rotate_90=rot,
+        rotate_90=rot if rot in ("cw", "ccw") else None,  # 'none' means no rotation (landscape mode)
     )
     # Ensure preview visualizer covers full range
     cfg.depth_vis.visual_min_m = 0.30
@@ -78,13 +78,13 @@ class RealSenseCaptureAdapter:
     def __init__(
         self,
         camera_config: Optional[CameraConfig] = None,
-        portrait_rotation: str = "cw",
+        portrait_rotation: str = "none",
         warmup_frames: int = 30,
         max_dropped_retries: int = 5,
         camera_factory: Optional[Callable[..., Any]] = None,
     ):
         self.camera_config = camera_config or full_body_camera_config(portrait_rotation=portrait_rotation)
-        self.portrait_rotation = portrait_rotation
+        self.portrait_rotation = str(portrait_rotation).lower()  # 'cw', 'ccw', or 'none'
         self.warmup_frames = int(warmup_frames)
         self.max_dropped_retries = int(max_dropped_retries)
         self._camera_factory = camera_factory
@@ -146,10 +146,11 @@ class RealSenseCaptureAdapter:
                     has_valid_intr = False
 
             if not has_valid_intr:
-                # Fallback to configured rotated dimensions
+                # Fallback to configured dimensions based on rotation mode
                 if self.camera_config.rotate_90 in ("cw", "ccw"):
                     w, h = self.camera_config.height, self.camera_config.width
                 else:
+                    # 'none' or no rotation: native landscape dimensions
                     w, h = self.camera_config.width, self.camera_config.height
                 fx = fy = float(max(w, h))
                 cx, cy = w / 2.0, h / 2.0
@@ -164,7 +165,6 @@ class RealSenseCaptureAdapter:
                 "is_post_rotation": bool(self.camera_config.rotate_90 in ("cw", "ccw")),
                 "is_post_decimation": False,
             }
-
             self._stream_profile_str = f"{self.camera_config.width}x{self.camera_config.height}@{self.camera_config.fps}fps"
 
             # Discard warm-up frames for auto-exposure, gain, and temporal stabilization

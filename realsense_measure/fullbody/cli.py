@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--subject-id", type=str, required=True, help="Anonymous subject ID (e.g. SUBJ_01, TEST_42).")
     p_cap.add_argument("--stops", type=int, default=8, help="Number of stops (default: 8).")
     p_cap.add_argument("--turn", type=str, choices=["cw", "ccw"], default="cw", help="Turn direction ('cw' or 'ccw').")
-    p_cap.add_argument("--portrait", type=str, choices=["cw", "ccw"], default="ccw", help="Portrait camera orientation ('cw' or 'ccw', default: 'ccw').")
+    p_cap.add_argument("--portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Portrait camera orientation: 'cw', 'ccw', or 'none' for horizontal/landscape mount (default: 'none').")
     p_cap.add_argument("--preview-only", action="store_true", help="Launch live operator preview without recording or saving a session.")
     p_cap.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera instead of hardware RealSense.")
     p_cap.add_argument("--burst-frames", type=int, default=30, help="Frames per stop burst (default: 30).")
@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 2. check-camera (Stage 27 hardware sanity check snapshot)
     p_chk = subparsers.add_parser("check-camera", help="Verify RealSense orientation, FOV, and depth sanity (no session).")
-    p_chk.add_argument("--portrait", type=str, choices=["cw", "ccw"], default="ccw", help="Portrait rotation ('cw' or 'ccw', default: 'ccw').")
+    p_chk.add_argument("--portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Portrait rotation: 'cw', 'ccw', or 'none' for horizontal/landscape mount (default: 'none').")
     p_chk.add_argument("--preview", action="store_true", help="Open an interactive live OpenCV preview window for orientation verification (press Q or ESC to exit).")
     p_chk.add_argument("--out", type=str, default="scan_output", help="Output directory to save check snapshot into DIR/check/.")
     p_chk.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera for headless testing.")
@@ -119,9 +119,10 @@ def _run_capture(args: argparse.Namespace) -> int:
 
     if getattr(args, "fake", False):
         from tests.fullbody.fake_camera import FakeCamera
+        # Landscape fake camera: native 848x480
         cam = FakeCamera(
-            width=480,
-            height=848,
+            width=848,
+            height=480,
             depth_scale=0.001,
             depth_units="sensor_units",
             fps=30.0,
@@ -138,14 +139,15 @@ def _run_capture(args: argparse.Namespace) -> int:
         return 1
 
     if getattr(args, "preview_only", False):
+        orient_label = "LANDSCAPE (no rotation)" if args.portrait == "none" else f"PORTRAIT {args.portrait.upper()}"
         print("\n" + "=" * 60)
         print("FULL-BODY CAPTURE PREVIEW-ONLY MODE")
         print("=" * 60)
-        print(f"Orientation: PORTRAIT {args.portrait.upper()}")
+        print(f"Orientation: {orient_label}")
         print("Live preview active. No capture session or files will be written to disk.")
         print("Press 'Q' or ESC in preview window to exit.\n")
         from realsense_measure.fullbody.capture_ui import render_frame
-        window_name = f"RealSense Live Capture Preview - Orientation: PORTRAIT {args.portrait.upper()} [Press Q to Exit]"
+        window_name = f"RealSense Live Capture Preview - {orient_label} [Press Q to Exit]"
         try:
             while True:
                 c, r, f, ts = cam.read_raw_filtered()
@@ -272,13 +274,17 @@ def _run_capture(args: argparse.Namespace) -> int:
 
 def _run_check_camera(args: argparse.Namespace) -> int:
     """Verify RealSense orientation, FOV, and depth sanity (no session)."""
+    portrait = getattr(args, "portrait", "none")
+    orient_label = "LANDSCAPE (no rotation)" if portrait == "none" else f"PORTRAIT {portrait.upper()}"
+
     if getattr(args, "fake", False):
         from tests.fullbody.fake_camera import FakeCamera
-        cam = FakeCamera(width=480, height=848, depth_scale=0.001, depth_units="sensor_units")
+        # Landscape fake camera: native 848x480
+        cam = FakeCamera(width=848, height=480, depth_scale=0.001, depth_units="sensor_units")
     else:
         from realsense_measure.fullbody.capture_camera import RealSenseCaptureAdapter, full_body_camera_config
-        cam_cfg = full_body_camera_config(portrait_rotation=args.portrait)
-        cam = RealSenseCaptureAdapter(camera_config=cam_cfg, portrait_rotation=args.portrait)
+        cam_cfg = full_body_camera_config(portrait_rotation=portrait)
+        cam = RealSenseCaptureAdapter(camera_config=cam_cfg, portrait_rotation=portrait)
 
     try:
         cam.start()
@@ -292,11 +298,11 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     try:
         if getattr(args, "preview", False):
             from realsense_measure.fullbody.capture_ui import render_frame
-            window_name = f"RealSense Camera Check - Orientation: PORTRAIT {args.portrait.upper()} [Press Q to Exit]"
+            window_name = f"RealSense Camera Check - {orient_label} [Press Q to Exit]"
             print("\n" + "=" * 60)
             print("REALSENSE CAMERA INTERACTIVE PREVIEW MODE")
             print("=" * 60)
-            print(f"Orientation: PORTRAIT {args.portrait.upper()}")
+            print(f"Orientation: {orient_label}")
             print(f"Window: '{window_name}'")
             print("Press 'Q' or ESC in preview window to exit and capture snapshot.\n")
             while True:
@@ -317,7 +323,7 @@ def _run_check_camera(args: argparse.Namespace) -> int:
                         "stop_index": 0,
                         "n_stops": 1,
                         "turn_direction": "cw",
-                        "orientation": args.portrait,
+                        "orientation": portrait,
                         "distance_m": med_depth_m,
                         "valid_depth_pct": valid_frac * 100.0,
                         "motion_mm": 0.0,
@@ -372,7 +378,8 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     print(f"Depth Scale:        {scale}")
     print(f"Stream Resolution:  {intr.get('width')}x{intr.get('height')}")
     print(f"Intrinsics (Rot):   fx={intr.get('fx'):.2f}, fy={intr.get('fy'):.2f}, cx={intr.get('cx'):.2f}, cy={intr.get('cy'):.2f}")
-    print(f"Portrait Rotation:  {args.portrait} (applied: {intr.get('is_post_rotation')})")
+    print(f"Orientation:        {orient_label}")
+    print(f"Rotation Applied:   {intr.get('is_post_rotation')}")
     print(f"ROI Median Depth:   {med_depth_m:.3f} m")
     print(f"ROI Valid Fraction: {valid_frac * 100.0:.1f} %")
     print("=" * 60 + "\n")
