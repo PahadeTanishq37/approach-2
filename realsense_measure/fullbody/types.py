@@ -139,6 +139,13 @@ class AlignedStop:
     prior_T_canonical_camera: Optional[np.ndarray] = None
     hit_clamp: bool = False
     review_status: str = "ACCEPTED"  # "ACCEPTED", "CLAMPED_PRIOR", "NEEDS_REVIEW"
+    edge_fitness: float = 1.0
+    edge_rmse_mm: float = 0.0
+    yaw_correction_deg: float = 0.0
+    registration_source: str = "nominal"  # "icp" | "nominal"
+    dominant_constraint: str = "icp"  # "icp" | "keypoints"
+    loop_closure_residual_deg: Optional[float] = None
+    loop_closure_residual_mm: Optional[float] = None
 
 
 @dataclass

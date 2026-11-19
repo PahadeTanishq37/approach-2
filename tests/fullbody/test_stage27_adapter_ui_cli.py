@@ -40,8 +40,8 @@ def test_full_body_camera_config():
     assert cfg_cw.width == 848
     assert cfg_cw.height == 480
     assert cfg_cw.fps == 30
-    assert cfg_cw.depth_max_m >= 2.6
-    assert cfg_cw.depth_min_m == pytest.approx(0.30)
+    assert cfg_cw.depth_max_m >= 4.0
+    assert cfg_cw.depth_min_m == pytest.approx(0.40)
     assert cfg_cw.use_decimation is False
     assert cfg_cw.rotate_90 == "cw"
 
@@ -288,4 +288,200 @@ def test_cli_check_camera_fake():
         txt = (chk_dir / "check_metrics.txt").read_text(encoding="utf-8")
         assert "portrait_rotation: cw" in txt
         assert "depth_scale:" in txt
+        assert "vertical_coverage_m:" in txt
+        assert "head_in_frame:" in txt
+        assert "feet_in_frame:" in txt
+        assert "floor_visible:" in txt
+        assert "automatic_acceptance:" in txt
+
+
+def test_cli_capture_background_fake():
+    """Verify capture-background --fake creates persistent background assets and floor calibration."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir) / "background"
+        argv = [
+            "capture-background",
+            "--out", str(out_dir),
+            "--burst-frames", "5",
+            "--fake",
+        ]
+        ret = main(argv)
+        assert ret == 0
+        assert (out_dir / "background_depth.npy").exists()
+        assert (out_dir / "background_color.png").exists()
+        assert (out_dir / "background_depth_colorized.png").exists()
+        assert (out_dir / "background_meta.json").exists()
+        assert (out_dir / "raw_burst").is_dir()
+        assert (out_dir / "raw_burst" / "color_000.png").exists()
+        assert (out_dir / "raw_burst" / "depth_000.npy").exists()
+
+        meta = json.loads((out_dir / "background_meta.json").read_text(encoding="utf-8"))
+        assert meta["burst_frames_captured"] == 5
+
+
+def test_render_frame_turntable_and_countdown():
+    """Verify render_frame formats turntable target text and WAIT_STILL countdown correctly."""
+    color = np.zeros((720, 1280, 3), dtype=np.uint8)
+    depth = np.full((720, 1280), 2.0, dtype=np.float32)
+
+    # Turntable prompt
+    snap_tt = {
+        "state": "TURN_PROMPT",
+        "stop_index": 2,
+        "n_stops": 8,
+        "turntable": True,
+        "turn_direction": "cw",
+    }
+    img_tt = render_frame(snap_tt, color, depth)
+    assert img_tt.shape == (720, 2560, 3)
+
+    # Non-turntable prompt
+    snap_turn = {
+        "state": "TURN_PROMPT",
+        "stop_index": 2,
+        "n_stops": 8,
+        "turntable": False,
+        "turn_direction": "cw",
+    }
+    img_turn = render_frame(snap_turn, color, depth)
+    assert not np.array_equal(img_tt, img_turn)
+
+    # WAIT_STILL countdown
+    snap_still = {
+        "state": "WAIT_STILL",
+        "stop_index": 0,
+        "n_stops": 8,
+        "stillness_frames_current": 5,
+        "stillness_frames_target": 15,
+    }
+    img_still = render_frame(snap_still, color, depth)
+    assert img_still.shape == (720, 2560, 3)
+
+
+def test_intrinsics_mismatch_fails_on_load():
+    """Verify load_capture_session fails if intrinsics differ from expected profile by >0.5 px."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir) / "intr_session"
+        argv = [
+            "capture",
+            "--out", str(out_dir),
+            "--subject-id", "SUBJ_INTR01",
+            "--stops", "8",
+            "--fake",
+            "--burst-frames", "2",
+            "--headless",
+            "--resolution", "848x480",
+        ]
+        assert main(argv) == 0
+
+        cfg = FullBodyConfig()
+
+        # Reading with matching or close expected intrinsics (<=0.5 px diff) must succeed
+        stops = load_capture_session(out_dir, cfg, expected_intrinsics={"fx": 425.2, "fy": 425.0, "cx": 424.0, "cy": 240.0})
+        assert len(stops) == 8
+
+        # Reading with mismatched intrinsics (>0.5 px diff) must raise ValueError
+        with pytest.raises(ValueError, match="Intrinsics mismatch in session"):
+            load_capture_session(out_dir, cfg, expected_intrinsics={"fx": 426.0, "fy": 425.0, "cx": 424.0, "cy": 240.0})
+
+
+def test_background_sha256_verification_on_load():
+    """Verify load_capture_session verifies background files.sha256 and detects tampering."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bg_dir = Path(tmpdir) / "bg_calib"
+        bg_argv = [
+            "capture-background",
+            "--out", str(bg_dir),
+            "--burst-frames", "3",
+            "--fake",
+        ]
+        assert main(bg_argv) == 0
+
+        # Capture session providing background
+        sess_dir = Path(tmpdir) / "sess_with_bg"
+        argv = [
+            "capture",
+            "--out", str(sess_dir),
+            "--subject-id", "SUBJ_BG01",
+            "--stops", "8",
+            "--fake",
+            "--burst-frames", "2",
+            "--background", str(bg_dir),
+            "--headless",
+        ]
+        assert main(argv) == 0
+
+        cfg = FullBodyConfig()
+        stops = load_capture_session(sess_dir, cfg)
+        assert len(stops) == 8
+
+        # Tamper with background file in session
+        tampered_file = sess_dir / "background" / "background_depth.npy"
+        assert tampered_file.exists()
+        tampered_file.write_bytes(tampered_file.read_bytes() + b"\x00")
+
+        # Loading tampered session must raise ValueError on SHA check
+        with pytest.raises(ValueError, match="SHA-256 integrity check failed for background file"):
+            load_capture_session(sess_dir, cfg)
+
+
+def test_modules_compatibility_720p_and_480p():
+    """Verify all full-body modules run properly at both 1280x720 and 848x480."""
+    import open3d as o3d
+    from tests.fullbody.fake_camera import FakeCamera
+    from realsense_measure.fullbody.burst import process_stop_burst
+    from realsense_measure.fullbody.confidence import compute_confidence_map
+    from realsense_measure.fullbody.floor import fit_floor_plane
+    from realsense_measure.fullbody.fusion import compute_foreground_mask
+    from realsense_measure.fullbody.keypoints import MediaPipePoseDetector
+
+    cfg = FullBodyConfig()
+    detector = MediaPipePoseDetector()
+
+    for res in ((1280, 720), (848, 480)):
+        w, h = res
+        cam = FakeCamera(width=w, height=h)
+        cam.start()
+        color, raw_d, filt_d, _ = cam.read_raw_filtered()
+        cam.stop()
+
+        assert color.shape == (h, w, 3)
+        assert raw_d.shape == (h, w)
+        d_m = raw_d.astype(np.float32) * cam.depth_scale
+        intr = o3d.camera.PinholeCameraIntrinsic(
+            w, h, cam.intrinsics["fx"], cam.intrinsics["fy"], cam.intrinsics["cx"], cam.intrinsics["cy"]
+        )
+
+        # 1. Foreground mask
+        bg_d = np.full((h, w), 2.50, dtype=np.float32)
+        fg_mask = compute_foreground_mask(d_m, bg_d, cfg)
+        assert fg_mask.shape == (h, w)
+        assert np.any(fg_mask)
+
+        # 2. Confidence map
+        conf_map, filt_depth = compute_confidence_map(d_m, intr, cfg)
+        assert conf_map.shape == (h, w)
+        assert np.nanmax(conf_map) > 0.05
+
+        # 3. Floor fit
+        # Synthetic floor in lower half
+        d_floor = d_m.copy()
+        cy = cam.intrinsics["cy"]
+        fy = cam.intrinsics["fy"]
+        for row in range(int(0.65 * h), h):
+            d_floor[row, :] = 0.95 * fy / max(1.0, row - cy)
+        floor_fit = fit_floor_plane(d_floor, intr, cfg)
+        assert floor_fit is not None
+        assert abs(floor_fit.normal[1]) > 0.5  # Up/down normal dominant
+
+        # 4. Burst processing
+        rep_c, fused_d, d_std, val_cnt = process_stop_burst([color, color], [d_m, d_m], cfg)
+        assert fused_d.shape == (h, w)
+        assert d_std.shape == (h, w)
+
+        # 5. Keypoint detector
+        pts_2d, confs, vis, p_mask = detector.detect_with_mask(color, d_m)
+        assert isinstance(pts_2d, dict)
+
+
 

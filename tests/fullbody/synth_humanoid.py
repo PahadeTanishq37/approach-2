@@ -254,6 +254,8 @@ class SyntheticHumanoidCaptureRenderer:
         fy: float = 428.0,
         cam_height_m: float = 0.90,
         cam_dist_m: float = 1.30,
+        cam_pitch_deg: float = 0.0,
+        cam_roll_deg: float = 0.0,
         seed: int = 42,
     ):
         self.width = width
@@ -264,6 +266,8 @@ class SyntheticHumanoidCaptureRenderer:
         self.cy = height / 2.0
         self.cam_height = cam_height_m
         self.cam_dist = cam_dist_m
+        self.cam_pitch_deg = cam_pitch_deg
+        self.cam_roll_deg = cam_roll_deg
         self.rng = np.random.RandomState(seed)
 
         self.intrinsics = o3d.camera.PinholeCameraIntrinsic(
@@ -316,15 +320,29 @@ class SyntheticHumanoidCaptureRenderer:
             mesh_copy.translate([dx, 0.0, dz])
 
             # Transform mesh into camera optical frame:
-            # World: +Y up, origin on floor at (0, 0, 0).
-            # Camera: position at (0, cam_height, -cam_dist), looking down +Z.
-            # In camera frame: X_cam = -X_world (right-handed optical frame), Y_cam = cam_height - Y_world, Z_cam = Z_world + cam_dist.
-            T_cam_world = np.array([
-                [-1.0,  0.0, 0.0,  0.0],
-                [ 0.0, -1.0, 0.0,  self.cam_height],
-                [ 0.0,  0.0, 1.0,  self.cam_dist],
-                [ 0.0,  0.0, 0.0,  1.0],
-            ], dtype=np.float64)
+            def _rot_x(rad):
+                c, s = np.cos(rad), np.sin(rad)
+                return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+            def _rot_z(rad):
+                c, s = np.cos(rad), np.sin(rad)
+                return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+
+            R_level = np.diag([-1.0, -1.0, 1.0])
+            if abs(self.cam_pitch_deg) > 1e-4 or abs(self.cam_roll_deg) > 1e-4:
+                R_tilt = _rot_x(np.deg2rad(self.cam_pitch_deg)) @ _rot_z(np.deg2rad(self.cam_roll_deg))
+                R_cam_world = R_tilt @ R_level
+                cam_pos_world = np.array([0.0, self.cam_height, -self.cam_dist], dtype=np.float64)
+                T_cam_world = np.eye(4, dtype=np.float64)
+                T_cam_world[:3, :3] = R_cam_world
+                T_cam_world[:3, 3] = -R_cam_world @ cam_pos_world
+            else:
+                T_cam_world = np.array([
+                    [-1.0,  0.0, 0.0,  0.0],
+                    [ 0.0, -1.0, 0.0,  self.cam_height],
+                    [ 0.0,  0.0, 1.0,  self.cam_dist],
+                    [ 0.0,  0.0, 0.0,  1.0],
+                ], dtype=np.float64)
 
             mesh_cam = o3d.geometry.TriangleMesh(mesh_copy)
             mesh_cam.transform(T_cam_world)
@@ -423,11 +441,20 @@ class SyntheticHumanoidCaptureRenderer:
             gt_keypoints_list.append(kpts_cam)
 
             # Compute ground truth transform camera -> canonical
-            T_canonical_world = np.eye(4, dtype=np.float64)
-            T_canonical_world[:3, :3] = R_body.T
-            T_canonical_world[:3, 3] = -R_body.T @ np.array([dx, 0.0, dz])
-            T_canonical_cam_gt = T_canonical_world @ np.linalg.inv(T_cam_world)
+            # Canonical frame at Stop 0 faces camera (180 deg yaw from world frame)
             gt_canonical_yaw = (180.0 - actual_yaw + 360.0) % 360.0
+            rad_canon = np.deg2rad(gt_canonical_yaw)
+            c_c, s_c = np.cos(rad_canon), np.sin(rad_canon)
+            R_canon_world = np.array([
+                [ c_c, 0.0, -s_c],
+                [ 0.0, 1.0,  0.0],
+                [ s_c, 0.0,  c_c],
+            ], dtype=np.float64)
+
+            T_canonical_world = np.eye(4, dtype=np.float64)
+            T_canonical_world[:3, :3] = R_canon_world
+            T_canonical_world[:3, 3] = -R_canon_world @ np.array([dx, 0.0, dz])
+            T_canonical_cam_gt = T_canonical_world @ np.linalg.inv(T_cam_world)
 
             single_kpts_cam = Keypoints3D(
                 names=kpt_names,
@@ -454,6 +481,47 @@ class SyntheticHumanoidCaptureRenderer:
             stops.append(stop_data)
 
         return stops, gt_measurements, gt_keypoints_list
+
+    def get_floor_plane(self) -> FloorPlane:
+        """Compute the true floor plane in camera coordinates for this camera configuration."""
+        from realsense_measure.fullbody.floor import build_gravity_rotation
+        def _rot_x(rad):
+            c, s = np.cos(rad), np.sin(rad)
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+        def _rot_z(rad):
+            c, s = np.cos(rad), np.sin(rad)
+            return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+
+        R_level = np.diag([-1.0, -1.0, 1.0])
+        if abs(self.cam_pitch_deg) > 1e-4 or abs(self.cam_roll_deg) > 1e-4:
+            R_tilt = _rot_x(np.deg2rad(self.cam_pitch_deg)) @ _rot_z(np.deg2rad(self.cam_roll_deg))
+            R_cam_world = R_tilt @ R_level
+            cam_pos_world = np.array([0.0, self.cam_height, -self.cam_dist], dtype=np.float64)
+            T_cam_world = np.eye(4, dtype=np.float64)
+            T_cam_world[:3, :3] = R_cam_world
+            T_cam_world[:3, 3] = -R_cam_world @ cam_pos_world
+        else:
+            T_cam_world = np.array([
+                [-1.0,  0.0, 0.0,  0.0],
+                [ 0.0, -1.0, 0.0,  self.cam_height],
+                [ 0.0,  0.0, 1.0,  self.cam_dist],
+                [ 0.0,  0.0, 0.0,  1.0],
+            ], dtype=np.float64)
+
+        n_cam = T_cam_world[:3, :3] @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        n_cam /= np.linalg.norm(n_cam)
+        p_cam = T_cam_world[:3, 3]
+        d_floor = -float(np.dot(n_cam, p_cam))
+        return FloorPlane(
+            coefficients=np.array([n_cam[0], n_cam[1], n_cam[2], d_floor], dtype=np.float64),
+            normal=n_cam,
+            point_on_plane=p_cam,
+            inlier_count=5000,
+            inlier_ratio=0.9,
+            rmse_m=0.002,
+            gravity_R_cam=build_gravity_rotation(n_cam),
+        )
 
 
 class GroundTruthKeypointDetector:

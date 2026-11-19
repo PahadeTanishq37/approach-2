@@ -102,7 +102,10 @@ class MediaPipePoseDetector:
                 logger.warning(f"  [keypoints] Could not initialize MediaPipe Pose: {exc}")
 
     def detect_with_mask(
-        self, color_bgr: np.ndarray
+        self,
+        color_bgr: np.ndarray,
+        depth_m: Optional[np.ndarray] = None,
+        prev_bbox: Optional[Tuple[int, int, int, int]] = None,
     ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float], Dict[str, float], Optional[np.ndarray]]:
         self._ensure_initialized()
         h, w = color_bgr.shape[:2]
@@ -125,45 +128,91 @@ class MediaPipePoseDetector:
             "left_foot_index": 31, "right_foot_index": 32,
         }
 
+        # Subject crop for pose detection:
+        # After depth-based or previous-frame localisation, crop a window
+        # (height full, width ~2x subject width, min 360 px) before MediaPipe
+        # and map keypoints back to full-image pixels.
+        u0 = 0
+        w_crop = w
+        if depth_m is not None:
+            fg_depth = (depth_m >= 0.8) & (depth_m <= 3.8)
+            col_counts = np.sum(fg_depth, axis=0)
+            valid_cols = np.where(col_counts > 10)[0]
+            if len(valid_cols) > 0:
+                u_min = int(np.min(valid_cols))
+                u_max = int(np.max(valid_cols))
+                w_subj = max(60, u_max - u_min)
+                u_mid = (u_min + u_max) / 2.0
+                w_crop = max(360, min(w, int(2.0 * w_subj)))
+                w_crop = (w_crop // 2) * 2
+                u0 = int(np.clip(u_mid - w_crop / 2.0, 0, w - w_crop))
+        elif prev_bbox is not None:
+            bx, by, bw, bh = prev_bbox
+            w_subj = max(60, bw)
+            u_mid = bx + bw / 2.0
+            w_crop = max(360, min(w, int(2.0 * w_subj)))
+            w_crop = (w_crop // 2) * 2
+            u0 = int(np.clip(u_mid - w_crop / 2.0, 0, w - w_crop))
+        elif w > 480:
+            # Native landscape: subject is nominally in central region
+            w_crop = max(360, min(w, int(w * 0.70)))
+            w_crop = (w_crop // 2) * 2
+            u0 = int((w - w_crop) // 2)
+
+        cropped_color = color_bgr[:, u0 : u0 + w_crop]
+        h_c, w_c = cropped_color.shape[:2]
+
         if self._landmarker is not None:
             try:
                 import mediapipe as mp
-                rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+                rgb = cv2.cvtColor(cropped_color, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 results = self._landmarker.detect(mp_image)
                 if getattr(results, "segmentation_masks", None):
-                    seg = results.segmentation_masks[0].numpy_view().squeeze()
-                    person_mask = (seg > 0.4).astype(bool)
+                    seg_c = results.segmentation_masks[0].numpy_view().squeeze()
+                    person_mask = np.zeros((h, w), dtype=bool)
+                    person_mask[:, u0 : u0 + w_crop] = (seg_c > 0.4)
                 if not results.pose_landmarks:
                     return pts_2d, conf_dict, vis_dict, person_mask
                 landmarks = results.pose_landmarks[0]
                 for name, idx in mp_indices.items():
                     lm = landmarks[idx]
-                    u = lm.x * (w - 1)
-                    v = lm.y * (h - 1)
-                    pts_2d[name] = (float(u), float(v))
-                    conf_dict[name] = float(getattr(lm, "presence", 1.0))
-                    vis_dict[name] = float(getattr(lm, "visibility", 1.0))
+                    u = float(u0 + lm.x * (w_c - 1))
+                    v = float(lm.y * (h - 1))
+                    conf = float(getattr(lm, "presence", 1.0))
+                    vis = float(getattr(lm, "visibility", 1.0))
+                    # 15 px edge rejection on full image
+                    if u < 15.0 or u > (w - 15.0) or v < 15.0 or v > (h - 15.0):
+                        conf = 0.0
+                    pts_2d[name] = (u, v)
+                    conf_dict[name] = conf
+                    vis_dict[name] = vis
             except Exception as exc:
                 logger.debug(f"  [keypoints] Tasks pose detection error: {exc}")
             return pts_2d, conf_dict, vis_dict, person_mask
 
         if self._pose is not None:
             try:
-                rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+                rgb = cv2.cvtColor(cropped_color, cv2.COLOR_BGR2RGB)
                 results = self._pose.process(rgb)
                 if getattr(results, "segmentation_mask", None) is not None:
-                    person_mask = (results.segmentation_mask > 0.4).astype(bool)
+                    person_mask = np.zeros((h, w), dtype=bool)
+                    person_mask[:, u0 : u0 + w_crop] = (results.segmentation_mask > 0.4)
                 if not results.pose_landmarks:
                     return pts_2d, conf_dict, vis_dict, person_mask
 
                 for name, idx in mp_indices.items():
                     lm = results.pose_landmarks.landmark[idx]
-                    u = lm.x * (w - 1)
-                    v = lm.y * (h - 1)
-                    pts_2d[name] = (float(u), float(v))
-                    conf_dict[name] = float(getattr(lm, "presence", 1.0))
-                    vis_dict[name] = float(getattr(lm, "visibility", 1.0))
+                    u = float(u0 + lm.x * (w_c - 1))
+                    v = float(lm.y * (h - 1))
+                    conf = float(getattr(lm, "presence", 1.0))
+                    vis = float(getattr(lm, "visibility", 1.0))
+                    # 15 px edge rejection on full image
+                    if u < 15.0 or u > (w - 15.0) or v < 15.0 or v > (h - 15.0):
+                        conf = 0.0
+                    pts_2d[name] = (u, v)
+                    conf_dict[name] = conf
+                    vis_dict[name] = vis
 
             except Exception as exc:
                 logger.debug(f"  [keypoints] Solutions pose detection error: {exc}")
@@ -171,9 +220,12 @@ class MediaPipePoseDetector:
         return pts_2d, conf_dict, vis_dict, person_mask
 
     def detect(
-        self, color_bgr: np.ndarray
+        self,
+        color_bgr: np.ndarray,
+        depth_m: Optional[np.ndarray] = None,
+        prev_bbox: Optional[Tuple[int, int, int, int]] = None,
     ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float], Dict[str, float]]:
-        pts_2d, conf_dict, vis_dict, _ = self.detect_with_mask(color_bgr)
+        pts_2d, conf_dict, vis_dict, _ = self.detect_with_mask(color_bgr, depth_m=depth_m, prev_bbox=prev_bbox)
         return pts_2d, conf_dict, vis_dict
 
 

@@ -23,7 +23,8 @@ head_scan_manual/
 my_head_scan/
 *_scan/
 raw_captures/
-raw_capture*/
+!raw_captures/**/background/**
+!raw_captures/background/**
 replay_*/
 *_replay/
 batch_runs/
@@ -43,6 +44,7 @@ seed_variation_summary.json
 *.npy
 *.pcd
 *.task
+!data/background/**
 models/
 models/smpl/
 

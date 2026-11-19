@@ -21,13 +21,91 @@ from realsense_measure.fullbody.types import AlignedStop, Keypoints3D, StopData
 logger = logging.getLogger(__name__)
 
 
+def compute_foreground_mask(
+    depth_m: np.ndarray,
+    bg_depth_m: Optional[np.ndarray],
+    cfg: FullBodyConfig,
+) -> np.ndarray:
+    """
+    Extract foreground subject mask from depth map using background-depth subtraction.
+    A pixel is foreground if its burst-median depth is >= 3 cm closer than the
+    background median at that pixel (and valid), followed by morphological open/close
+    and keeping the largest connected component.
+
+    Parameters
+    ----------
+    depth_m:
+        HxW float32 metric depth of the stop (e.g. burst median).
+    bg_depth_m:
+        HxW float32 metric depth of the empty scene background, or None.
+    cfg:
+        FullBodyConfig instance.
+
+    Returns
+    -------
+    np.ndarray:
+        HxW boolean mask of foreground subject pixels.
+    """
+    h, w = depth_m.shape[:2]
+    valid_curr = (depth_m >= cfg.depth_min_m) & (depth_m <= cfg.depth_max_m) & np.isfinite(depth_m)
+
+    if bg_depth_m is not None:
+        if bg_depth_m.shape[:2] != (h, w):
+            bg_depth_m = cv2.resize(bg_depth_m, (w, h), interpolation=cv2.INTER_NEAREST)
+        valid_bg = (bg_depth_m >= cfg.depth_min_m) & (bg_depth_m <= cfg.depth_max_m) & np.isfinite(bg_depth_m)
+        # Pixel is foreground if depth is >= 3 cm closer than background
+        is_fg = valid_curr & valid_bg & ((bg_depth_m - depth_m) >= 0.03)
+        # If background pixel was missing or invalid, retain valid depth
+        is_fg |= (valid_curr & ~valid_bg)
+    else:
+        # Fallback when no background is provided (e.g. standalone synthetic test)
+        is_fg = valid_curr
+
+    if not np.any(is_fg):
+        return np.zeros((h, w), dtype=bool)
+
+    # Morphological open then close
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask_u8 = is_fg.astype(np.uint8)
+    opened = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+
+    # Keep largest connected component
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    if num_labels <= 1:
+        return np.zeros((h, w), dtype=bool)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_idx = 1 + int(np.argmax(areas))
+    max_area = stats[largest_idx, cv2.CC_STAT_AREA]
+    min_comp_area = max(300, int(0.01 * max_area))
+    valid_labels = [
+        lbl for lbl in range(1, num_labels)
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_comp_area
+    ]
+    fg_mask = np.isin(labels, valid_labels)
+    return fg_mask
+
+
 def fuse_aligned_stops(
     stops: List[StopData],
     aligned_stops: List[AlignedStop],
     cfg: FullBodyConfig,
+    bg_depth: Optional[np.ndarray] = None,
 ) -> Tuple[o3d.geometry.TriangleMesh, o3d.geometry.PointCloud, Dict[str, float]]:
     """
     Integrate multi-stop RGB-D frames into a single ScalableTSDFVolume.
+
+    Parameters
+    ----------
+    stops:
+        List of StopData instances.
+    aligned_stops:
+        List of AlignedStop instances.
+    cfg:
+        FullBodyConfig instance.
+    bg_depth:
+        Optional background depth array in metres for background-subtraction foreground gating.
 
     Returns
     -------
@@ -47,25 +125,13 @@ def fuse_aligned_stops(
 
         extrinsic = np.linalg.inv(a.T_canonical_camera)
 
-        # Prepare RGB-D
+        # Prepare RGB-D with shared background-depth subtraction foreground mask
         color_rgb = np.ascontiguousarray(s.color[:, :, ::-1])
+        fg_mask = compute_foreground_mask(s.depth, bg_depth, cfg)
         depth = s.depth.copy()
+        depth[~fg_mask] = 0.0
         if s.confidence_map is not None:
             depth[s.confidence_map < cfg.min_confidence_threshold] = 0.0
-        if s.person_mask is not None:
-            # Dilate person mask to preserve outer silhouettes and hair while rejecting walls
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-            dilated = cv2.dilate(s.person_mask.astype(np.uint8), kernel).astype(bool)
-            core_depths = depth[s.person_mask & (depth > cfg.depth_min_m)]
-            if len(core_depths) > 50:
-                z_med = float(np.median(core_depths))
-                # Accept depth within 0.50 m of subject depth to exclude background room walls
-                depth_consistent = (depth >= max(cfg.depth_min_m, z_med - 0.50)) & (
-                    depth <= min(cfg.depth_max_m, z_med + 0.50)
-                )
-                depth[~dilated | ~depth_consistent] = 0.0
-            else:
-                depth[~dilated] = 0.0
 
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         color_o3d = o3d.geometry.Image(color_rgb.astype(np.uint8))
@@ -116,18 +182,8 @@ def fuse_aligned_stops(
                 depth = s.depth.copy()
                 if s.confidence_map is not None:
                     depth[s.confidence_map < cfg.min_confidence_threshold] = 0.0
-                if s.person_mask is not None:
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-                    dilated = cv2.dilate(s.person_mask.astype(np.uint8), kernel).astype(bool)
-                    core_depths = depth[s.person_mask & (depth > cfg.depth_min_m)]
-                    if len(core_depths) > 50:
-                        z_med = float(np.median(core_depths))
-                        depth_consistent = (depth >= max(cfg.depth_min_m, z_med - 0.50)) & (
-                            depth <= min(cfg.depth_max_m, z_med + 0.50)
-                        )
-                        depth[~dilated | ~depth_consistent] = 0.0
-                    else:
-                        depth[~dilated] = 0.0
+                fg_mask = compute_foreground_mask(depth, bg_depth, cfg)
+                depth[~fg_mask] = 0.0
                 depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
                 color_o3d = o3d.geometry.Image(color_rgb.astype(np.uint8))
                 rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(

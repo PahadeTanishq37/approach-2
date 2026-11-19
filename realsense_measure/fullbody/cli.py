@@ -18,12 +18,14 @@ Strictly lazy imports so importing this module never pulls in Open3D or pyrealse
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
 import sys
 import time
 from typing import Any, List, Optional
+import warnings
 
 import cv2
 import numpy as np
@@ -39,40 +41,53 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # 1. capture (Stage 27 live capture controller)
-    p_cap = subparsers.add_parser("capture", help="Live eight-stop capture controller with operator preview.")
+    p_cap = subparsers.add_parser("capture", help="Live eight- or twelve-stop capture controller with operator preview.")
     p_cap.add_argument("--out", type=str, required=True, help="Destination directory for the capture session.")
     p_cap.add_argument("--subject-id", type=str, required=True, help="Anonymous subject ID (e.g. SUBJ_01, TEST_42).")
-    p_cap.add_argument("--stops", type=int, default=8, help="Number of stops (default: 8).")
+    p_cap.add_argument("--stops", type=int, default=8, help="Number of stops: 8 or 12 (default: 8).")
     p_cap.add_argument("--turn", type=str, choices=["cw", "ccw"], default="cw", help="Turn direction ('cw' or 'ccw').")
+    p_cap.add_argument("--turntable", action="store_true", default=False, help="Turntable mode (rotates turntable instead of subject turning on foot).")
+    p_cap.add_argument("--resolution", type=str, choices=["1280x720", "848x480"], default="1280x720", help="Camera stream resolution: '1280x720' (default) or '848x480'.")
+    p_cap.add_argument("--raw-only", action=argparse.BooleanOptionalAction, default=True, help="Save raw z16/color and disable RealSense temporal/hole filters (default: True).")
+    p_cap.add_argument("--background", type=str, default="raw_captures/background", help="Path to background calibration directory (default: raw_captures/background).")
     p_cap.add_argument("--portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Portrait camera orientation: 'cw', 'ccw', or 'none' for horizontal/landscape mount (default: 'none').")
     p_cap.add_argument("--preview-only", action="store_true", help="Launch live operator preview without recording or saving a session.")
     p_cap.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera instead of hardware RealSense.")
-    p_cap.add_argument("--burst-frames", type=int, default=30, help="Frames per stop burst (default: 30).")
+    p_cap.add_argument("--burst-frames", type=int, default=15, help="Frames per stop burst (default: 15).")
     p_cap.add_argument("--headless", action="store_true", help="Run without opening GUI preview window.")
-    p_cap.add_argument("--dist-min", type=float, default=1.10, help="Minimum subject distance in metres (default: 1.10).")
-    p_cap.add_argument("--dist-max", type=float, default=1.50, help="Maximum subject distance in metres (default: 1.50).")
+    p_cap.add_argument("--dist-min", type=float, default=1.70, help="Minimum subject distance in metres (default: 1.70).")
+    p_cap.add_argument("--dist-max", type=float, default=2.40, help="Maximum subject distance in metres (default: 2.40).")
     p_cap.add_argument("--no-head-feet-check", action="store_true", help="Disable strict head and feet unclipped check.")
     p_cap.add_argument("--turn-prompt-timeout", type=float, default=10.0, help="Turn prompt timeout in seconds (default: 10.0).")
+    p_cap.add_argument("--hold-still-s", type=float, default=2.0, help="Hold-still countdown duration in seconds (default: 2.0).")
     p_cap.add_argument("--motion-limit", type=float, default=10.0, help="Subject motion limit in mm (default: 10.0).")
     p_cap.add_argument("--max-retakes", type=int, default=3, help="Max retakes per stop (default: 3).")
 
     # 2. check-camera (Stage 27 hardware sanity check snapshot)
     p_chk = subparsers.add_parser("check-camera", help="Verify RealSense orientation, FOV, and depth sanity (no session).")
-    p_chk.add_argument("--portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Portrait rotation: 'cw', 'ccw', or 'none' for horizontal/landscape mount (default: 'none').")
+    p_chk.add_argument("--portrait", "--rotation", dest="portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Camera rotation: 'none' for horizontal/landscape mount, 'cw', or 'ccw' (default: 'none').")
     p_chk.add_argument("--preview", action="store_true", help="Open an interactive live OpenCV preview window for orientation verification (press Q or ESC to exit).")
     p_chk.add_argument("--out", type=str, default="scan_output", help="Output directory to save check snapshot into DIR/check/.")
     p_chk.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera for headless testing.")
 
-    # 3. scan
+    # 3. capture-background
+    p_bg = subparsers.add_parser("capture-background", help="Capture empty-scene background burst and calibrate single floor plane.")
+    p_bg.add_argument("--out", type=str, default="raw_captures/background", help="Persistent destination directory for background assets (default: raw_captures/background).")
+    p_bg.add_argument("--portrait", "--rotation", dest="portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Camera rotation (default: 'none').")
+    p_bg.add_argument("--burst-frames", type=int, default=30, help="Number of frames in background burst (default: 30).")
+    p_bg.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera for headless testing.")
+
+    # 4. scan
     p_scan = subparsers.add_parser("scan", help="Run full-body alignment, fusion, and measurement.")
     p_scan.add_argument("--capture", type=str, required=True, help="Path to raw capture directory.")
     p_scan.add_argument("--out", type=str, default="scan_output/fullbody", help="Output directory.")
     p_scan.add_argument("--stops", type=int, default=8, help="Number of stops (default: 8).")
     p_scan.add_argument("--voxel", type=float, default=0.005, help="TSDF voxel length in metres.")
+    p_scan.add_argument("--background", type=str, default="raw_captures/background", help="Path to background calibration directory.")
     p_scan.add_argument("--no-viz", action="store_true", help="Run without opening GUI windows.")
     p_scan.add_argument("--verbose", action="store_true", help="Enable debug logging.")
 
-    # 4. measure
+    # 5. measure
     p_meas = subparsers.add_parser("measure", help="Extract measurements from an existing fused scan.")
     p_meas.add_argument("--scan", type=str, required=True, help="Directory containing fused.ply or scan_result.json.")
 
@@ -98,6 +113,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_kpt.add_argument("depth", type=str, nargs="?", default=None, help="Optional path to depth array (.npy).")
     p_kpt.add_argument("--out", type=str, default=None, help="Optional output image path for skeleton overlay.")
 
+    # 9. debug-stop
+    p_dbg = subparsers.add_parser(
+        "debug-stop",
+        help="Generate per-stop debug visualisations and quantitative stats.json.",
+    )
+    p_dbg.add_argument("session_dir", type=str, help="Path to capture session directory.")
+    p_dbg.add_argument("--stop", type=int, required=True, help="Stop index to debug (e.g. 0, 1, ...).")
+    p_dbg.add_argument("--out", type=str, default=None, help="Optional output directory (default: <session_dir>/debug/stop_NN).")
+
+    # 10. validate-session
+    p_vs = subparsers.add_parser(
+        "validate-session",
+        help="Run comprehensive session validation, leave-one-out cross-validation, and report.",
+    )
+    p_vs.add_argument("session_dir", type=str, help="Path to capture session directory.")
+    p_vs.add_argument("--tape", type=str, default="data/tape_measurements.json", help="Path to ground truth tape measurements JSON.")
+    p_vs.add_argument("--out", type=str, default=None, help="Optional path to output validation JSON.")
+    p_vs.add_argument("--report", type=str, default=None, help="Optional path to output validation markdown report.")
+
     return parser
 
 
@@ -117,20 +151,31 @@ def _run_capture(args: argparse.Namespace) -> int:
     if not getattr(args, "preview_only", False):
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    res_str = getattr(args, "resolution", "1280x720")
     if getattr(args, "fake", False):
         from tests.fullbody.fake_camera import FakeCamera
-        # Landscape fake camera: native 848x480
+        if "x" in res_str:
+            w_c, h_c = [int(v) for v in res_str.lower().split("x")]
+        else:
+            w_c, h_c = 1280, 720
         cam = FakeCamera(
-            width=848,
-            height=480,
+            width=w_c,
+            height=h_c,
             depth_scale=0.001,
             depth_units="sensor_units",
             fps=30.0,
         )
     else:
         from realsense_measure.fullbody.capture_camera import RealSenseCaptureAdapter, full_body_camera_config
-        cam_cfg = full_body_camera_config(portrait_rotation=args.portrait)
-        cam = RealSenseCaptureAdapter(camera_config=cam_cfg, portrait_rotation=args.portrait)
+        cam_cfg = full_body_camera_config(
+            portrait_rotation=args.portrait,
+            resolution=res_str,
+            raw_only=getattr(args, "raw_only", True),
+        )
+        cam = RealSenseCaptureAdapter(
+            camera_config=cam_cfg,
+            portrait_rotation=args.portrait,
+        )
 
     try:
         cam.start()
@@ -165,6 +210,7 @@ def _run_capture(args: argparse.Namespace) -> int:
                         "stop_index": 0,
                         "n_stops": args.stops,
                         "turn_direction": args.turn,
+                        "turntable": getattr(args, "turntable", False),
                         "orientation": args.portrait,
                         "distance_m": med_depth_m,
                         "valid_depth_pct": valid_frac * 100.0,
@@ -192,6 +238,15 @@ def _run_capture(args: argparse.Namespace) -> int:
     controller: Optional[CaptureController] = None
 
     try:
+        # Load background depth map for foreground segmentation if available
+        bg_depth = None
+        bg_dir = Path(getattr(args, "background", "raw_captures/background"))
+        if bg_dir.exists() and (bg_dir / "background_depth.npy").exists():
+            try:
+                bg_depth = np.load(str(bg_dir / "background_depth.npy")).astype(np.float32)
+            except Exception as e:
+                logger.warning(f"Failed to load background depth: {e}")
+
         writer = SessionWriter(
             root=out_dir,
             subject_id=subject_id,
@@ -202,14 +257,19 @@ def _run_capture(args: argparse.Namespace) -> int:
             depth_scale=cam.depth_scale,
             depth_units=cam.depth_units,
             device_info=cam.device_info(),
+            turntable=getattr(args, "turntable", False),
+            background_dir=bg_dir if bg_dir.exists() else None,
         )
 
+        hold_still_s = float(getattr(args, "hold_still_s", 2.0))
+        stillness_frames = int(round(hold_still_s * 30.0))
         thresholds = CaptureThresholds(
             burst_frames=args.burst_frames,
+            stillness_frames=stillness_frames,
             motion_limit_mm=getattr(args, "motion_limit", 10.0),
             max_retakes=getattr(args, "max_retakes", 3),
-            dist_min_m=getattr(args, "dist_min", 1.10),
-            dist_max_m=getattr(args, "dist_max", 1.50),
+            dist_min_m=getattr(args, "dist_min", 1.70),
+            dist_max_m=getattr(args, "dist_max", 2.40),
             require_head_feet=not getattr(args, "no_head_feet_check", False),
             turn_prompt_timeout_s=getattr(args, "turn_prompt_timeout", 10.0),
         )
@@ -238,6 +298,8 @@ def _run_capture(args: argparse.Namespace) -> int:
             writer=writer,
             thresholds=thresholds,
             landmark_fn=landmark_fn,
+            bg_depth=bg_depth,
+            turntable=getattr(args, "turntable", False),
         )
 
         headless = bool(getattr(args, "headless", False))
@@ -369,20 +431,188 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     med_depth_m = float(np.median(valid_roi)) if len(valid_roi) > 0 else 0.0
     valid_frac = float(len(valid_roi)) / float(roi.size)
 
-    print("\n" + "=" * 60)
+    # Automatic acceptance checks:
+    import open3d as o3d
+    from realsense_measure.fullbody.config import FullBodyConfig
+    from realsense_measure.fullbody.coverage import compute_coverage_metrics
+    from realsense_measure.fullbody.floor import fit_floor_plane
+
+    cfg_chk = FullBodyConfig()
+    o3d_intr = o3d.camera.PinholeCameraIntrinsic(
+        int(intr["width"]), int(intr["height"]),
+        float(intr["fx"]), float(intr["fy"]),
+        float(intr["cx"]), float(intr["cy"]),
+    )
+
+    # 1. Coverage helper & recommended standoffs
+    cov_170 = compute_coverage_metrics(intr, subject_height_m=1.70)
+    cov_180 = compute_coverage_metrics(intr, subject_height_m=1.80)
+    cov_190 = compute_coverage_metrics(intr, subject_height_m=1.90)
+
+    # 2. Floor plane visible & Camera pitch estimated from floor plane
+    floor = fit_floor_plane(d_m, o3d_intr, cfg_chk)
+    floor_ok = (floor is not None and floor.inlier_count >= 100)
+    pitch_deg: Optional[float] = None
+    pitch_ok = False
+    if floor is not None:
+        ny = float(floor.normal[1])
+        nz = float(floor.normal[2])
+        pitch_deg = float(np.rad2deg(np.arctan2(abs(nz), max(1e-6, abs(ny)))))
+        pitch_ok = bool(pitch_deg <= 15.0)
+
+    # 3. Head apex and sole framing margins (>= 4% at both ends; warn if head margin > 15%)
+    head_ok = False
+    feet_ok = False
+    head_warn = False
+    margin_ratio = 0.04
+    margin_px = int(margin_ratio * h)
+
+    v_head_top: Optional[float] = None
+    v_sole: Optional[float] = None
+    framing_source = "heuristic"
+
+    # Check if a background session exists to use the foreground mask directly
+    bg_candidates = [
+        Path(args.out) / "background",
+        Path("raw_captures/background"),
+        Path(args.out).parent / "background",
+    ]
+    bg_depth_file = next((p / "background_depth.npy" for p in bg_candidates if (p / "background_depth.npy").exists()), None)
+
+    if bg_depth_file is not None:
+        try:
+            bg_depth_map = np.load(str(bg_depth_file)).astype(np.float32)
+            from realsense_measure.fullbody.fusion import compute_foreground_mask
+            fg_mask = compute_foreground_mask(d_m, bg_depth_map, cfg_chk)
+            if np.sum(fg_mask) >= 200:
+                fg_rows = np.where(fg_mask)[0]
+                v_head_top = float(np.min(fg_rows))
+                v_sole = float(np.max(fg_rows))
+                framing_source = f"background_foreground_mask ({bg_depth_file.parent.name})"
+        except Exception as exc:
+            logger.debug(f"Failed foreground mask from background depth: {exc}")
+
+    # If no background session or foreground mask was empty, use keypoints + depth-valid person component
+    if v_head_top is None or v_sole is None:
+        try:
+            from realsense_measure.fullbody.keypoints import MediaPipePoseDetector
+            detector = MediaPipePoseDetector()
+            pts_2d, conf_2d, vis_2d = detector.detect(last_color, depth_m=d_m)
+
+            # Head cranial landmarks (nose, eyes, ears)
+            cranial_keys = ["nose", "left_eye", "right_eye", "left_ear", "right_ear"]
+            cranial_v = [pts_2d[k][1] for k in cranial_keys if k in pts_2d and conf_2d.get(k, 0.0) >= 0.20]
+
+            # Feet/sole: foot_index and heel (strictly exclude ankle landmarks)
+            feet_keys = ["left_heel", "right_heel", "left_foot_index", "right_foot_index"]
+            feet_v = [pts_2d[k][1] for k in feet_keys if k in pts_2d and conf_2d.get(k, 0.0) >= 0.20]
+
+            # Subject horizontal extent
+            if pts_2d:
+                all_u = [pts_2d[k][0] for k in pts_2d if conf_2d.get(k, 0.0) >= 0.20]
+                u_min = max(0, int(min(all_u) - 30)) if all_u else int(w * 0.2)
+                u_max = min(w, int(max(all_u) + 30)) if all_u else int(w * 0.8)
+            else:
+                u_min, u_max = int(w * 0.2), int(w * 0.8)
+
+            # Depth-valid person component around median standoff
+            z_ref = med_depth_m if med_depth_m >= 0.50 else cfg_chk.camera_distance_m
+            person_depth = (d_m >= max(0.4, z_ref - 0.45)) & (d_m <= (z_ref + 0.45))
+            person_depth[:, :u_min] = False
+            person_depth[:, u_max:] = False
+
+            if np.sum(person_depth) >= 100:
+                p_rows = np.where(person_depth)[0]
+                d_min_row = float(np.min(p_rows))
+                d_max_row = float(np.max(p_rows))
+                # Head top is minimum row of person depth or cranial landmark minus cranial offset
+                if cranial_v:
+                    v_head_top = min(d_min_row, min(cranial_v) - 0.05 * h)
+                else:
+                    v_head_top = d_min_row
+
+                # Sole is maximum row of person depth or foot landmarks
+                if feet_v:
+                    v_sole = max(d_max_row, max(feet_v))
+                else:
+                    v_sole = d_max_row
+                framing_source = "depth_component_and_keypoints"
+            elif cranial_v or feet_v:
+                if cranial_v:
+                    v_head_top = min(cranial_v) - 0.05 * h
+                if feet_v:
+                    v_sole = max(feet_v)
+                framing_source = "keypoints_only"
+        except Exception as exc:
+            logger.debug(f"MediaPipe detection in check-camera skipped: {exc}")
+
+    head_margin_pct: Optional[float] = None
+    sole_margin_pct: Optional[float] = None
+
+    if v_head_top is not None:
+        head_margin_pct = float(max(0.0, v_head_top) / h) * 100.0
+        head_ok = bool(head_margin_pct >= 4.0)
+        head_warn = bool(head_margin_pct > 15.0)
+
+    if v_sole is not None:
+        sole_margin_pct = float(max(0.0, h - 1.0 - v_sole) / h) * 100.0
+        feet_ok = bool(sole_margin_pct >= 4.0)
+
+    # 4. Standoff inside config range [capture_dist_min_m, capture_dist_max_m]
+    standoff_ok = bool(cfg_chk.capture_dist_min_m <= med_depth_m <= cfg_chk.capture_dist_max_m)
+
+    # 5. Vertical coverage in metres
+    z_eval = med_depth_m if med_depth_m >= 0.50 else cfg_chk.camera_distance_m
+    fy = float(intr.get("fy", 427.0))
+    vertical_coverage_m = float(h * z_eval / fy) if fy > 0 else 0.0
+
+    is_accepted = bool(head_ok and feet_ok and floor_ok and standoff_ok and pitch_ok)
+
+    print("\n" + "=" * 64)
     print("REALSENSE CAMERA CHECK REPORT")
-    print("=" * 60)
+    print("=" * 64)
     print(f"Device Name:        {dev_info.get('name', 'Intel RealSense')}")
     print(f"Serial Number:      {dev_info.get('serial_number', 'UNKNOWN')}")
     print(f"Firmware Version:   {dev_info.get('firmware_version', 'UNKNOWN')}")
     print(f"Depth Scale:        {scale}")
     print(f"Stream Resolution:  {intr.get('width')}x{intr.get('height')}")
-    print(f"Intrinsics (Rot):   fx={intr.get('fx'):.2f}, fy={intr.get('fy'):.2f}, cx={intr.get('cx'):.2f}, cy={intr.get('cy'):.2f}")
+    print(f"Intrinsics:         fx={intr.get('fx'):.2f}, fy={intr.get('fy'):.2f}, cx={intr.get('cx'):.2f}, cy={intr.get('cy'):.2f}")
     print(f"Orientation:        {orient_label}")
-    print(f"Rotation Applied:   {intr.get('is_post_rotation')}")
+    print(f"Framing Source:     {framing_source}")
     print(f"ROI Median Depth:   {med_depth_m:.3f} m")
     print(f"ROI Valid Fraction: {valid_frac * 100.0:.1f} %")
-    print("=" * 60 + "\n")
+    print(f"Vertical Coverage:  {vertical_coverage_m:.2f} m (at {z_eval:.2f} m standoff)")
+    print("-" * 64)
+    print("COVERAGE & RECOMMENDED STANDOFF (5% MARGIN):")
+    print(f"  Vertical coverage rate:   {cov_180.vertical_rate_m_per_m:.2f} m/m")
+    print(f"  Horizontal coverage rate: {cov_180.horizontal_rate_m_per_m:.2f} m/m")
+    print(f"  Recommended standoff for H=1.70m: {cov_170.recommended_standoff_m:.2f} m")
+    print(f"  Recommended standoff for H=1.80m: {cov_180.recommended_standoff_m:.2f} m")
+    print(f"  Recommended standoff for H=1.90m: {cov_190.recommended_standoff_m:.2f} m")
+    print("-" * 64)
+    print("AUTOMATIC ACCEPTANCE CHECKS:")
+    warn_str = " [WARN: >15% unused vertical space]" if head_warn else ""
+    if head_margin_pct is not None:
+        head_desc = f"PASS (margin={head_margin_pct:.1f}%, row={v_head_top:.1f}px >= {margin_px}px){warn_str}" if head_ok else f"FAIL (margin={head_margin_pct:.1f}%, row={v_head_top:.1f}px < {margin_px}px)"
+    else:
+        head_desc = "FAIL (no cranial landmark or foreground detected)"
+
+    if sole_margin_pct is not None:
+        feet_desc = f"PASS (margin={sole_margin_pct:.1f}%, sole row={v_sole:.1f}px <= {h - margin_px}px)" if feet_ok else f"FAIL (margin={sole_margin_pct:.1f}%, sole row={v_sole:.1f}px > {h - margin_px}px)"
+    else:
+        feet_desc = "FAIL (no foot landmark or foreground detected)"
+
+    floor_desc = f"PASS (inliers={floor.inlier_count}, normal=[{floor.normal[0]:.2f}, {floor.normal[1]:.2f}, {floor.normal[2]:.2f}])" if floor_ok else "FAIL (floor plane not found)"
+    standoff_desc = f"PASS ({med_depth_m:.2f}m in [{cfg_chk.capture_dist_min_m:.2f}, {cfg_chk.capture_dist_max_m:.2f}]m)" if standoff_ok else f"FAIL ({med_depth_m:.2f}m out of [{cfg_chk.capture_dist_min_m:.2f}, {cfg_chk.capture_dist_max_m:.2f}]m)"
+    pitch_desc = f"PASS ({pitch_deg:.1f} deg <= 15.0 deg)" if pitch_ok else (f"FAIL/WARN ({pitch_deg:.1f} deg > 15.0 deg)" if pitch_deg is not None else "FAIL (no floor plane)")
+    print(f"  1. Head in frame (>=4%):   {head_desc}")
+    print(f"  2. Sole in frame (>=4%):   {feet_desc}")
+    print(f"  3. Floor pixels visible:   {floor_desc}")
+    print(f"  4. Standoff in config:     {standoff_desc}")
+    print(f"  5. Camera pitch <= 15 deg: {pitch_desc}")
+    print("-" * 64)
+    print(f"OVERALL ACCEPTANCE:          {'ACCEPTED' if is_accepted else 'REJECTED'}")
+    print("=" * 64 + "\n")
 
     check_dir = Path(args.out) / "check"
     check_dir.mkdir(parents=True, exist_ok=True)
@@ -392,6 +622,7 @@ def _run_check_camera(args: argparse.Namespace) -> int:
 
     cv2.imwrite(str(check_dir / "check_color.png"), last_color)
     cv2.imwrite(str(check_dir / "check_depth_colorized.png"), depth_vis)
+    np.save(str(check_dir / "check_depth.npy"), d_m)
 
     metrics_txt = check_dir / "check_metrics.txt"
     with open(metrics_txt, "w", encoding="utf-8") as f:
@@ -404,11 +635,176 @@ def _run_check_camera(args: argparse.Namespace) -> int:
         f.write(f"portrait_rotation: {args.portrait}\n")
         f.write(f"roi_median_depth_m: {med_depth_m:.3f}\n")
         f.write(f"roi_valid_fraction: {valid_frac:.4f}\n")
+        f.write(f"vertical_coverage_m: {vertical_coverage_m:.3f}\n")
+        f.write(f"vertical_coverage_rate: {cov_180.vertical_rate_m_per_m:.4f}\n")
+        f.write(f"horizontal_coverage_rate: {cov_180.horizontal_rate_m_per_m:.4f}\n")
+        f.write(f"recommended_standoff_h170_m: {cov_170.recommended_standoff_m:.3f}\n")
+        f.write(f"recommended_standoff_h180_m: {cov_180.recommended_standoff_m:.3f}\n")
+        f.write(f"recommended_standoff_h190_m: {cov_190.recommended_standoff_m:.3f}\n")
+        f.write(f"camera_pitch_deg: {pitch_deg if pitch_deg is not None else 0.0:.2f}\n")
+        f.write(f"camera_pitch_ok: {pitch_ok}\n")
+        f.write(f"standoff_in_range: {standoff_ok}\n")
+        f.write(f"head_in_frame: {head_ok}\n")
+        f.write(f"head_margin_pct: {head_margin_pct if head_margin_pct is not None else 0.0:.2f}\n")
+        f.write(f"head_margin_warn: {head_warn}\n")
+        f.write(f"feet_in_frame: {feet_ok}\n")
+        f.write(f"sole_margin_pct: {sole_margin_pct if sole_margin_pct is not None else 0.0:.2f}\n")
+        f.write(f"floor_visible: {floor_ok}\n")
+        f.write(f"framing_source: {framing_source}\n")
+        f.write(f"automatic_acceptance: {'ACCEPTED' if is_accepted else 'REJECTED'}\n")
 
     print(f"Snapshot saved to: {check_dir}")
     print("  - check_color.png")
     print("  - check_depth_colorized.png")
+    print("  - check_depth.npy")
     print("  - check_metrics.txt\n")
+    return 0
+
+
+def _run_capture_background(args: argparse.Namespace) -> int:
+    """Capture empty-scene background burst, save raw depth/color, and calibrate single floor plane."""
+    import open3d as o3d
+    from realsense_measure.fullbody.config import FullBodyConfig
+    from realsense_measure.fullbody.floor import fit_floor_plane, save_floor_plane
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = FullBodyConfig()
+
+    portrait = getattr(args, "portrait", "none")
+    if getattr(args, "fake", False):
+        from tests.fullbody.fake_camera import FakeCamera
+        cam = FakeCamera(
+            width=848 if portrait == "none" else 480,
+            height=480 if portrait == "none" else 848,
+            depth_scale=0.001,
+            depth_units="sensor_units",
+            fps=30.0,
+            empty_scene=True,
+        )
+    else:
+        from realsense_measure.fullbody.capture_camera import RealSenseCaptureAdapter, full_body_camera_config
+        cam_cfg = full_body_camera_config(portrait_rotation=portrait)
+        cam = RealSenseCaptureAdapter(camera_config=cam_cfg, portrait_rotation=portrait)
+
+    try:
+        cam.start()
+    except Exception as exc:
+        print(f"Error starting camera: {exc}", file=sys.stderr)
+        return 1
+
+    burst_frames = int(getattr(args, "burst_frames", 30))
+    print(f"\nCapturing {burst_frames}-frame empty-scene background burst ...")
+
+    raw_colors = []
+    raw_depths = []
+    try:
+        start_t = time.time()
+        while len(raw_depths) < burst_frames and (time.time() - start_t) < 15.0:
+            c, r, f, ts = cam.read_raw_filtered()
+            if c is not None and r is not None:
+                raw_colors.append(c)
+                raw_depths.append(r)
+            time.sleep(0.033)
+    finally:
+        cam.stop()
+
+    min_required = min(burst_frames, max(1, burst_frames // 2))
+    if len(raw_depths) < min_required:
+        print(f"Error: Acquired only {len(raw_depths)} frames, expected at least {min_required} (target: {burst_frames}).", file=sys.stderr)
+        return 1
+
+    print(f"Acquired {len(raw_depths)} frames. Computing temporal median background depth ...")
+    scale = cam.depth_scale if cam.depth_units == "sensor_units" else 1.0
+    depth_m_stack = np.stack([d.astype(np.float32) * scale for d in raw_depths], axis=0)
+    valid_mask = (depth_m_stack > 0.1) & (depth_m_stack < 6.0)
+    masked_stack = np.where(valid_mask, depth_m_stack, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        bg_median_depth = np.nanmedian(masked_stack, axis=0)
+    bg_median_depth = np.nan_to_num(bg_median_depth, nan=0.0).astype(np.float32)
+
+    rep_color = raw_colors[len(raw_colors) // 2]
+
+    # Save raw burst frames to persistent subfolder
+    raw_dir = out_dir / "raw_burst"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for idx, (c, d) in enumerate(zip(raw_colors, raw_depths)):
+        cv2.imwrite(str(raw_dir / f"color_{idx:03d}.png"), c)
+        np.save(str(raw_dir / f"depth_{idx:03d}.npy"), d)
+
+    # Save processed background assets
+    np.save(str(out_dir / "background_depth.npy"), bg_median_depth)
+    cv2.imwrite(str(out_dir / "background_color.png"), rep_color)
+
+    from realsense_measure.fullbody.capture_ui import colorize_depth_m
+    depth_vis = colorize_depth_m(bg_median_depth)
+    cv2.imwrite(str(out_dir / "background_depth_colorized.png"), depth_vis)
+
+    intr = cam.intrinsics
+    o3d_intr = o3d.camera.PinholeCameraIntrinsic(
+        int(intr["width"]), int(intr["height"]),
+        float(intr["fx"]), float(intr["fy"]),
+        float(intr["cx"]), float(intr["cy"]),
+    )
+
+    print("Fitting floor plane from background depth map ...")
+    floor = fit_floor_plane(bg_median_depth, o3d_intr, cfg)
+
+    # Query IMU gravity if available via pyrealsense2
+    imu_gravity = getattr(cam, "get_imu_gravity", lambda: None)()
+    imu_angle_deg: Optional[float] = None
+    if imu_gravity is not None and floor is not None:
+        try:
+            dot_prod = abs(float(np.dot(imu_gravity, floor.normal)))
+            cos_val = np.clip(dot_prod / (np.linalg.norm(imu_gravity) * np.linalg.norm(floor.normal)), -1.0, 1.0)
+            imu_angle_deg = float(np.rad2deg(np.arccos(cos_val)))
+        except Exception:
+            imu_angle_deg = None
+
+    cam_h_m = float(abs(floor.coefficients[3])) if floor is not None else None
+    meta = {
+        "device_info": cam.device_info(),
+        "intrinsics": intr,
+        "burst_frames_requested": burst_frames,
+        "burst_frames_captured": len(raw_depths),
+        "portrait_rotation": portrait,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "floor_detected": floor is not None,
+        "camera_height_m": cam_h_m,
+        "imu_gravity": imu_gravity.tolist() if imu_gravity is not None else None,
+        "imu_floor_angle_deg": imu_angle_deg,
+    }
+    with open(out_dir / "background_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    if floor is not None:
+        save_floor_plane(floor, out_dir / "background_floor.json")
+        print("\n" + "=" * 60)
+        print("BACKGROUND CAPTURE & FLOOR CALIBRATION REPORT")
+        print("=" * 60)
+        print(f"Destination:        {out_dir}")
+        print(f"Frames Captured:    {len(raw_depths)}")
+        print(f"Floor Detected:     YES (inliers={floor.inlier_count}, ratio={floor.inlier_ratio:.2f}, rmse={floor.rmse_m*1000:.1f} mm)")
+        print(f"Floor Normal:       [{floor.normal[0]:.4f}, {floor.normal[1]:.4f}, {floor.normal[2]:.4f}]")
+        print(f"Camera Height:      {cam_h_m:.3f} m (perpendicular distance above floor)")
+        if imu_gravity is not None:
+            print(f"IMU Gravity:        [{imu_gravity[0]:.4f}, {imu_gravity[1]:.4f}, {imu_gravity[2]:.4f}]")
+            if imu_angle_deg is not None:
+                print(f"IMU vs Floor Angle: {imu_angle_deg:.2f} deg")
+        else:
+            print("IMU Sensor:         Not available or unstreamable")
+        print(f"Floor Assets:       {out_dir / 'background_floor.json'}")
+        print("=" * 60 + "\n")
+    else:
+        print("\n" + "=" * 60)
+        print("BACKGROUND CAPTURE REPORT (FLOOR NOT DETECTED)")
+        print("=" * 60)
+        print(f"Destination:        {out_dir}")
+        print(f"Frames Captured:    {len(raw_depths)}")
+        print("Floor Detected:     NO (RANSAC found insufficient lower-region inliers)")
+        print("=" * 60 + "\n")
+
     return 0
 
 
@@ -416,8 +812,8 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
     """Execute the complete full-body reconstruction and measurement pipeline."""
     from realsense_measure.fullbody.alignment import align_stops
     from realsense_measure.fullbody.confidence import compute_confidence_map
-    from realsense_measure.fullbody.floor import fit_floor_plane, verify_floor_consistency
-    from realsense_measure.fullbody.fusion import fuse_aligned_stops
+    from realsense_measure.fullbody.floor import fit_floor_plane, load_floor_plane
+    from realsense_measure.fullbody.fusion import compute_foreground_mask, fuse_aligned_stops
     from realsense_measure.fullbody.io import load_capture_session, save_scan_result
     from realsense_measure.fullbody.keypoints import MediaPipePoseDetector, lift_keypoints_to_3d
     from realsense_measure.fullbody.measure_scan import measure_fused_scan
@@ -427,24 +823,70 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
     logger.info(f"Loading capture session from {capture_dir} ...")
     stops = load_capture_session(capture_dir, cfg)
 
-    detector = MediaPipePoseDetector()
-    detected_floors = []
+    # 1. Resolve single background floor plane & background depth
+    bg_dir = getattr(cfg, "background_dir", None)
+    if bg_dir is None:
+        bg_dir = Path("raw_captures/background")
+    else:
+        bg_dir = Path(bg_dir)
 
-    logger.info(f"Processing {len(stops)} stops (keypoint detection, floor fitting, confidence map) ...")
+    session_bg = Path(capture_dir) / "background"
+    active_bg_dir = session_bg if session_bg.exists() else bg_dir
+
+    bg_depth: Optional[np.ndarray] = None
+    rep_floor: Optional[FloorPlane] = None
+    floor_observed = False
+
+    bg_depth_p = active_bg_dir / "background_depth.npy"
+    if bg_depth_p.exists():
+        try:
+            bg_depth = np.load(str(bg_depth_p)).astype(np.float32)
+            logger.info(f"Loaded background depth map from {bg_depth_p} (shape {bg_depth.shape})")
+        except Exception as exc:
+            logger.warning(f"Failed to load background depth: {exc}")
+
+    bg_floor_p = active_bg_dir / "background_floor.json"
+    if bg_floor_p.exists():
+        rep_floor = load_floor_plane(bg_floor_p)
+        if rep_floor is not None:
+            floor_observed = True
+            logger.info(
+                f"Using calibrated single floor plane from {bg_floor_p}: "
+                f"normal={rep_floor.normal}, height={rep_floor.point_on_plane[1]:.3f} m"
+            )
+
+    if rep_floor is None and stops and stops[0].depth is not None:
+        # Fit floor plane ONCE from the first stop (no per-stop consensus)
+        rep_floor = fit_floor_plane(stops[0].depth, stops[0].intrinsics, cfg)
+        if rep_floor is not None:
+            floor_observed = True
+            logger.info(
+                f"Fitted single floor plane from stop 0: "
+                f"normal={rep_floor.normal}, height={rep_floor.point_on_plane[1]:.3f} m"
+            )
+
+    # If there is no background and floor could not be fitted, fail loudly with instructions
+    if rep_floor is None:
+        raise RuntimeError(
+            f"No background calibration found in '{active_bg_dir}'.\n"
+            "Full-body scanning requires a pre-calibrated empty scene background and floor plane.\n"
+            "Please run: python -m realsense_measure.fullbody capture-background --out <SESSION_OR_BG_DIR>\n"
+            "to capture background depth and calibrate the floor plane before running scan."
+        )
+
+    camera_height_m = float(abs(rep_floor.coefficients[3]))
+    session_meta = {"camera_height_m": camera_height_m}
+    logger.info(f"Floor plane established (observed={floor_observed}, normal={rep_floor.normal}, camera_height={camera_height_m:.3f} m).")
+
+    detector = MediaPipePoseDetector()
+    logger.info(f"Processing {len(stops)} stops (keypoint detection, confidence map, background subtraction) ...")
     for s in stops:
-        # 1. 2D keypoints and 3D lifting
-        if hasattr(detector, "detect_with_mask"):
-            pts_2d, conf_2d, vis_2d, p_mask = detector.detect_with_mask(s.color)
-            s.person_mask = p_mask
-        else:
-            pts_2d, conf_2d, vis_2d = detector.detect(s.color)
+        # 1. 2D keypoints and 3D lifting (MediaPipe kept ONLY for keypoints)
+        pts_2d, conf_2d, vis_2d = detector.detect(s.color, depth_m=s.depth)
         s.keypoints_camera = lift_keypoints_to_3d(pts_2d, conf_2d, vis_2d, s.depth, s.intrinsics, cfg)
 
-        # 2. Floor plane
-        floor = fit_floor_plane(s.depth, s.intrinsics, cfg)
-        if floor is not None:
-            s.floor_plane = floor
-            detected_floors.append(floor)
+        # 2. Assign the single floor plane to each stop
+        s.floor_plane = rep_floor
 
         # 3. Confidence map
         conf_map, filtered_depth = compute_confidence_map(
@@ -452,25 +894,14 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
         )
         s.confidence_map = conf_map
 
-        # 4. Point cloud in camera frame
+        # 4. Point cloud in camera frame with shared background-depth subtraction
         color_rgb = np.ascontiguousarray(s.color[:, :, ::-1])
+        fg_mask = compute_foreground_mask(s.depth, bg_depth, cfg)
         depth_m = s.depth.copy()
-        depth_m[depth_m < cfg.depth_min_m] = 0.0
-        depth_m[depth_m > cfg.depth_max_m] = 0.0
+        depth_m[~fg_mask] = 0.0
         if s.confidence_map is not None:
             depth_m[s.confidence_map < cfg.min_confidence_threshold] = 0.0
-        if s.person_mask is not None:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-            dilated_m = cv2.dilate(s.person_mask.astype(np.uint8), kernel).astype(bool)
-            core_depths = depth_m[s.person_mask & (depth_m > cfg.depth_min_m)]
-            if len(core_depths) > 50:
-                z_med = float(np.median(core_depths))
-                depth_consistent = (depth_m >= max(cfg.depth_min_m, z_med - 0.50)) & (
-                    depth_m <= min(cfg.depth_max_m, z_med + 0.50)
-                )
-                depth_m[~dilated_m | ~depth_consistent] = 0.0
-            else:
-                depth_m[~dilated_m] = 0.0
+
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(color_rgb),
             o3d.geometry.Image(depth_m),
@@ -480,37 +911,13 @@ def run_pipeline(capture_dir: Path, out_dir: Path, cfg: Any) -> Any:
         )
         s.pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, s.intrinsics)
 
-    floor_observed = False
-    if detected_floors:
-        is_consistent, rep_floor = verify_floor_consistency(detected_floors, cfg)
-        if is_consistent and len(detected_floors) >= 3:
-            floor_observed = True
-        else:
-            logger.warning(
-                f"Floor planes across stops are insufficient ({len(detected_floors)} < 3) or inconsistent; "
-                f"floor marked as unobserved."
-            )
-    else:
-        logger.warning("No floor planes detected across stops; falling back to nominal gravity floor.")
-        from realsense_measure.fullbody.types import FloorPlane
-        rep_floor = FloorPlane(
-            coefficients=np.array([0.0, -1.0, 0.0, 1.0]),
-            normal=np.array([0.0, -1.0, 0.0]),
-            point_on_plane=np.array([0.0, 1.0, 1.3]),
-            inlier_count=0,
-            inlier_ratio=0.0,
-            rmse_m=0.0,
-            gravity_R_cam=np.eye(3),
-        )
-    logger.info(f"Floor plane verification complete (observed={floor_observed}, normal={rep_floor.normal}, height={rep_floor.point_on_plane[1]:.3f} m).")
-
     # Alignment
     logger.info("Aligning multi-stop point clouds with joint prior and 4-DoF MAP-ICP ...")
     aligned = align_stops(stops, rep_floor, cfg)
 
     # Fusion
     logger.info("Fusing aligned point clouds via Open3D TSDF Integration ...")
-    mesh, fused_pcd, hole_map = fuse_aligned_stops(stops, aligned, cfg)
+    mesh, fused_pcd, hole_map = fuse_aligned_stops(stops, aligned, cfg, bg_depth=bg_depth)
 
     # Anthropometric measurements
     logger.info("Extracting tape-style anthropometric measurements ...")
@@ -564,6 +971,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.subcommand == "check-camera":
         return _run_check_camera(args)
 
+    elif args.subcommand == "capture-background":
+        return _run_capture_background(args)
+
     elif args.subcommand == "scan":
         from realsense_measure.fullbody.config import FullBodyConfig
         cfg = FullBodyConfig()
@@ -571,6 +981,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.num_stops = args.stops
         cfg.tsdf_voxel_length_m = args.voxel
         cfg.verbose = args.verbose
+        if getattr(args, "background", None):
+            cfg.background_dir = Path(args.background)
 
         result = run_pipeline(Path(args.capture), Path(args.out), cfg)
         print("\n" + result.summary_table() + "\n")
@@ -628,6 +1040,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         d_path = Path(args.depth) if args.depth else None
         o_path = Path(args.out) if args.out else None
         return _run_keypoints_check(c_path, d_path, o_path)
+
+    elif args.subcommand == "debug-stop":
+        from realsense_measure.fullbody.debug import debug_stop
+        debug_stop(args.session_dir, args.stop, out_dir=args.out)
+        return 0
+
+    elif args.subcommand == "validate-session":
+        from realsense_measure.fullbody.validate import validate_session
+        validate_session(
+            args.session_dir,
+            tape_path=args.tape,
+            out_path=args.out,
+            report_path=args.report,
+        )
+        return 0
 
     return 0
 

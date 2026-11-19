@@ -20,6 +20,7 @@ import numpy as np
 import open3d as o3d
 
 from realsense_measure.fullbody.config import FullBodyConfig
+from realsense_measure.fullbody.session_format import warn_if_git_ignored
 from realsense_measure.fullbody.types import (
     AlignedStop,
     MeasurementResult,
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 def load_capture_session(
     capture_dir: Union[str, Path],
     cfg: FullBodyConfig,
+    expected_intrinsics: Optional[Dict[str, float]] = None,
 ) -> List[StopData]:
     """
     Load a raw full-body capture directory into a list of StopData.
@@ -56,19 +58,25 @@ def load_capture_session(
     FileNotFoundError:
         If capture directory or required files do not exist.
     ValueError:
-        If the directory format is unrecognized or invalid.
+        If the directory format is unrecognized or invalid, or if intrinsics
+        differ from expected by >0.5 px.
     """
     p = Path(capture_dir)
+    warn_if_git_ignored(p)
     if not p.exists() or not p.is_dir():
         raise FileNotFoundError(f"Capture directory does not exist: {p}")
+
+    exp_intr = expected_intrinsics
+    if exp_intr is None and hasattr(cfg, "expected_intrinsics"):
+        exp_intr = cfg.expected_intrinsics
 
     meta_file = p / "meta.json"
     if meta_file.exists():
         with open(meta_file, "r", encoding="utf-8") as f:
             meta_peek = json.load(f)
         if meta_peek.get("layout") == "stops_v2":
-            return _load_stops_v2(p, meta_file, meta_peek, cfg)
-        return _load_meta_json_session(p, meta_file, cfg)
+            return _load_stops_v2(p, meta_file, meta_peek, cfg, expected_intrinsics=exp_intr)
+        return _load_meta_json_session(p, meta_file, cfg, expected_intrinsics=exp_intr)
 
     # Check for per-stop subdirectories
     subdirs = sorted([d for d in p.iterdir() if d.is_dir() and d.name.startswith("stop_")])
@@ -87,6 +95,7 @@ def _load_stops_v2(
     meta_path: Path,
     meta: Dict[str, Any],
     cfg: FullBodyConfig,
+    expected_intrinsics: Optional[Dict[str, float]] = None,
 ) -> List[StopData]:
     """Parse extended session layout 'stops_v2'."""
     import hashlib
@@ -129,6 +138,19 @@ def _load_stops_v2(
     fy = float(intr_dict.get("fy", 425.0))
     cx = float(intr_dict.get("cx", 424.0))
     cy = float(intr_dict.get("cy", 240.0))
+
+    # Validate against expected/active stream intrinsics (>0.5 px discrepancy fails)
+    if expected_intrinsics is not None:
+        for k, meta_val in (("fx", fx), ("fy", fy), ("cx", cx), ("cy", cy)):
+            if k in expected_intrinsics:
+                exp_val = float(expected_intrinsics[k])
+                diff = abs(meta_val - exp_val)
+                if diff > 0.5:
+                    raise ValueError(
+                        f"Intrinsics mismatch in session '{root}': meta.{k}={meta_val:.2f} differs "
+                        f"from expected active stream {exp_val:.2f} by {diff:.2f} px (> 0.5 px limit)"
+                    )
+
     intrinsics = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
 
     depth_scale = float(meta.get("depth_scale", 0.001))
@@ -267,6 +289,31 @@ def _load_stops_v2(
             )
         )
 
+    # Verify background SHA-256 manifest if background session exists
+    bg_dir = root / "background"
+    if bg_dir.is_dir():
+        bg_sha = bg_dir / "files.sha256"
+        if bg_sha.exists():
+            with open(bg_sha, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(maxsplit=1)
+                    if len(parts) == 2:
+                        expected_h, fname = parts
+                        fpath = bg_dir / fname.strip()
+                        if not fpath.exists():
+                            raise FileNotFoundError(
+                                f"Background file listed in SHA-256 not found: '{fpath}'"
+                            )
+                        actual_h = hashlib.sha256(fpath.read_bytes()).hexdigest()
+                        if actual_h != expected_h:
+                            raise ValueError(
+                                f"SHA-256 integrity check failed for background file '{fname}': "
+                                f"expected {expected_h}, got {actual_h}"
+                            )
+
     logger.info(f"  [io] Loaded {len(stops)} stops from stops_v2 session in {root}")
     return stops
 
@@ -275,6 +322,7 @@ def _load_meta_json_session(
     root: Path,
     meta_path: Path,
     cfg: FullBodyConfig,
+    expected_intrinsics: Optional[Dict[str, float]] = None,
 ) -> List[StopData]:
     """Parse session recorded via standard realsense_measure save_raw_capture."""
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -283,10 +331,22 @@ def _load_meta_json_session(
     intr_dict = meta.get("intrinsics", {})
     w = intr_dict.get("width", 848)
     h = intr_dict.get("height", 480)
-    fx = intr_dict.get("fx", 428.0)
-    fy = intr_dict.get("fy", 428.0)
-    cx = intr_dict.get("cx", 422.0)
-    cy = intr_dict.get("cy", 244.0)
+    fx = float(intr_dict.get("fx", 428.0))
+    fy = float(intr_dict.get("fy", 428.0))
+    cx = float(intr_dict.get("cx", 422.0))
+    cy = float(intr_dict.get("cy", 244.0))
+
+    if expected_intrinsics is not None:
+        for k, meta_val in (("fx", fx), ("fy", fy), ("cx", cx), ("cy", cy)):
+            if k in expected_intrinsics:
+                exp_val = float(expected_intrinsics[k])
+                diff = abs(meta_val - exp_val)
+                if diff > 0.5:
+                    raise ValueError(
+                        f"Intrinsics mismatch in session '{root}': meta.{k}={meta_val:.2f} differs "
+                        f"from expected active stream {exp_val:.2f} by {diff:.2f} px (> 0.5 px limit)"
+                    )
+
     intrinsics = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
 
     frames = meta.get("frames", [])

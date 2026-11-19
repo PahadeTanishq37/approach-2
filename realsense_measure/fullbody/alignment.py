@@ -3,23 +3,31 @@ realsense_measure/fullbody/alignment.py
 
 Multi-stop full-body alignment:
 1. Floor-constrained gravity frame (locks height + pitch + roll to gravity).
-2. Keypoint-based yaw and body-axis prior.
-3. Bounded 4-DoF point-to-plane ICP on rigid body parts with loop closure.
-4. Per-limb articulated rigid refinement (arms).
+2. Keypoint-based yaw and common vertical turning axis prior.
+3. Multi-view Pose-Graph optimization with Levenberg-Marquardt.
+4. Analytical 3-parameter motion (yaw about vertical + XZ translation) ICP on rigid body parts
+   (head, torso, pelvis; arms excluded).
+   NOTE: Per-limb articulated refinement for arms is not implemented here (known limitation).
+5. 3D keypoint constraints on torso/head to resolve cylindrical yaw ambiguity.
+6. Loop-closure error evaluation on closing edge before optimization.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
 
 from realsense_measure.fullbody.config import FullBodyConfig
+from realsense_measure.fullbody.orientation import canonical_yaw_deg
 from realsense_measure.fullbody.parts import (
     ARM_PARTS,
+    RIGID_PARTS,
     BodyPart,
     is_arm_point,
     is_rigid_point,
@@ -39,10 +47,12 @@ def compute_gravity_transform(floor: FloorPlane) -> np.ndarray:
     """
     Build 4x4 matrix T_grav_cam that aligns camera coords with gravity frame:
     floor plane is at Y = 0, normal is +Y = [0, 1, 0].
+    Camera optical center projects to (0, d, 0) in gravity frame.
     """
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = floor.gravity_R_cam
-    T[:3, 3] = -floor.gravity_R_cam @ floor.point_on_plane
+    d = float(floor.coefficients[3])
+    T[:3, 3] = np.array([0.0, d, 0.0], dtype=np.float64)
     return T
 
 
@@ -257,18 +267,39 @@ def check_and_enforce_loop_closure(
     cfg: FullBodyConfig,
 ) -> float:
     """
-    Check loop closure: sum of relative yaws between consecutive stops should equal 360 deg.
+    Check loop closure drift across stops.
+    Consumes the real closing edge residual if recorded on stops;
+    otherwise computes drift from registered poses.
     Returns loop closure drift in degrees.
     """
     n = len(stops)
     if n < 4:
         return 0.0
 
-    yaws = np.array([s.refined_yaw_deg for s in stops], dtype=np.float64)
+    if stops and getattr(stops[0], "loop_closure_residual_deg", None) is not None:
+        drift = float(stops[0].loop_closure_residual_deg)
+        logger.info(f"  [align] Loop closure drift from closing edge = {drift:.2f} deg")
+        if abs(drift) > 20.0:
+            logger.warning(f"  [align] Loop closure drift {drift:.2f} deg exceeds 20 deg! Flagging review.")
+            for s in stops:
+                s.review_status = "NEEDS_REVIEW"
+        return drift
+
+    # Standalone fallback for mock AlignedStop instances without precomputed closing edge
+    yaws = []
+    for s in stops:
+        if s.T_canonical_camera is not None and not np.allclose(s.T_canonical_camera[:3, :3], np.eye(3)):
+            R = s.T_canonical_camera[:3, :3]
+            yaw_val = float(np.rad2deg(np.arctan2(R[2, 0], R[0, 0])))
+        else:
+            yaw_val = float(s.refined_yaw_deg)
+        yaws.append(yaw_val)
+    yaws_arr = np.array(yaws, dtype=np.float64)
+
     step_deg = 360.0 / float(n)
     expected_step = -step_deg if cfg.turn_direction == "cw" else step_deg
     expected_span = (n - 1) * expected_step
-    actual_span = (yaws[-1] - yaws[0] + 180.0) % 360.0 - 180.0
+    actual_span = (yaws_arr[-1] - yaws_arr[0] + 180.0) % 360.0 - 180.0
     drift = float((actual_span - expected_span + 180.0) % 360.0 - 180.0)
 
     logger.info(f"  [align] Loop closure drift = {drift:.2f} deg (expected span {expected_span:.1f} deg, actual {actual_span:.1f} deg)")
@@ -277,6 +308,20 @@ def check_and_enforce_loop_closure(
         for i, s in enumerate(stops):
             adj = -drift * (i / float(n))
             s.refined_yaw_deg += adj
+            if s.T_canonical_camera is not None:
+                rad = np.deg2rad(adj)
+                c_y, s_y = np.cos(rad), np.sin(rad)
+                R_adj = np.array([
+                    [ c_y, 0.0, -s_y, 0.0],
+                    [ 0.0, 1.0,  0.0, 0.0],
+                    [ s_y, 0.0,  c_y, 0.0],
+                    [ 0.0, 0.0,  0.0, 1.0],
+                ], dtype=np.float64)
+                s.T_canonical_camera = R_adj @ s.T_canonical_camera
+                if s.pcd_canonical is not None:
+                    s.pcd_canonical.transform(R_adj)
+                if s.keypoints_canonical is not None:
+                    s.keypoints_canonical = s.keypoints_canonical.transform(R_adj, "canonical")
     else:
         logger.warning(f"  [align] Loop closure drift {drift:.2f} deg exceeds 20 deg! Flagging review.")
         for s in stops:
@@ -421,9 +466,9 @@ def align_stops(
             )
         )
 
-    # 3. Refinement loop (MAP-style 4-DoF ICP on rigid parts)
+    # 3. Refinement loop (Pose-Graph optimization on rigid parts)
     if n_stops > 1:
-        _refine_alignment_multiview(aligned_stops, cfg)
+        _refine_alignment_multiview(aligned_stops, cfg, raw_stops=stops)
 
     # 4. Enforce loop consistency
     if n_stops >= 4:
@@ -432,190 +477,535 @@ def align_stops(
     return aligned_stops
 
 
+def solve_3param_point_to_plane_icp(
+    src_pcd: o3d.geometry.PointCloud,
+    ref_pcd: o3d.geometry.PointCloud,
+    voxel_scales: Tuple[float, ...] = (0.02, 0.01, 0.005),
+    max_iter_per_scale: int = 15,
+    distance_threshold_m: float = 0.06,
+) -> Tuple[np.ndarray, float, float, float]:
+    """
+    Solve relative transform between two clouds using analytical 3-parameter motion ICP:
+    parameters are xi = (theta, tx, tz) for rotation about vertical (+Y) and XZ translation.
+    Does NOT solve 6-DoF and project afterwards.
+
+    Supports multi-scale voxels (20 mm, 10 mm, 5 mm) with colored ICP (point-to-plane fallback).
+
+    Returns:
+      (T_delta, fitness, rmse_mm, rmse_before_mm)
+    """
+    if len(src_pcd.points) < 10 or len(ref_pcd.points) < 10:
+        return np.eye(4, dtype=np.float64), 0.0, 999.0, 999.0
+
+    pts_src_orig = np.asarray(src_pcd.points)
+    pts_ref_orig = np.asarray(ref_pcd.points)
+
+    # Initial evaluation
+    tree_init = cKDTree(pts_ref_orig)
+    dists_init, _ = tree_init.query(pts_src_orig, k=1)
+    inliers_init = dists_init < distance_threshold_m
+    rmse_before_mm = (
+        float(np.sqrt(np.mean(dists_init[inliers_init] ** 2)) * 1000.0)
+        if np.any(inliers_init)
+        else 999.0
+    )
+
+    curr_theta = 0.0
+    curr_tx = 0.0
+    curr_tz = 0.0
+
+    for vox in voxel_scales:
+        src_down = src_pcd.voxel_down_sample(vox) if vox > 0 else src_pcd
+        ref_down = ref_pcd.voxel_down_sample(vox) if vox > 0 else ref_pcd
+
+        if len(src_down.points) < 10 or len(ref_down.points) < 10:
+            continue
+
+        src_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=max(3.0 * vox, 0.03), max_nn=20)
+        )
+        ref_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=max(3.0 * vox, 0.03), max_nn=20)
+        )
+
+        pts_s = np.asarray(src_down.points)
+        pts_r = np.asarray(ref_down.points)
+        nrms_s = np.asarray(src_down.normals)
+        nrms_r = np.asarray(ref_down.normals)
+
+        tree = cKDTree(pts_r)
+        d_max = max(2.5 * vox, distance_threshold_m)
+
+        # Check for color variance for colored ICP
+        has_color = False
+        color_grad_r = None
+        gray_s = None
+        gray_r = None
+        if (
+            src_down.has_colors()
+            and ref_down.has_colors()
+            and len(src_down.colors) == len(pts_s)
+            and len(ref_down.colors) == len(pts_r)
+        ):
+            c_s = np.asarray(src_down.colors)
+            c_r = np.asarray(ref_down.colors)
+            if float(np.var(c_r)) > 0.005:
+                gray_s = 0.299 * c_s[:, 0] + 0.587 * c_s[:, 1] + 0.114 * c_s[:, 2]
+                gray_r = 0.299 * c_r[:, 0] + 0.587 * c_r[:, 1] + 0.114 * c_r[:, 2]
+                color_grad_r = np.zeros_like(pts_r)
+                dists_knn, idxs_knn = tree.query(pts_r, k=min(7, len(pts_r)))
+                for k_idx in range(len(pts_r)):
+                    nn = idxs_knn[k_idx, 1:]
+                    dp = pts_r[nn] - pts_r[k_idx]
+                    dc = gray_r[nn] - gray_r[k_idx]
+                    if len(nn) >= 3:
+                        g, _, _, _ = np.linalg.lstsq(dp, dc, rcond=None)
+                        color_grad_r[k_idx] = g
+                has_color = True
+
+        for _ in range(max_iter_per_scale):
+            c = np.cos(curr_theta)
+            s = np.sin(curr_theta)
+            R_cur = np.array([[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]], dtype=np.float64)
+            t_cur = np.array([curr_tx, 0.0, curr_tz], dtype=np.float64)
+
+            p_trans = (pts_s @ R_cur.T) + t_cur
+            n_trans = nrms_s @ R_cur.T
+
+            dists, idxs = tree.query(p_trans, k=1)
+            valid = (dists < d_max) & (np.sum(n_trans * nrms_r[idxs], axis=1) > 0.4)
+            if np.sum(valid) < 10:
+                break
+
+            p = p_trans[valid]
+            q = pts_r[idxs[valid]]
+            n = nrms_r[idxs[valid]]
+
+            r_geom = np.sum(n * (p - q), axis=1)
+            p_rot_x = p[:, 0] - curr_tx
+            p_rot_z = p[:, 2] - curr_tz
+            J_geom = np.column_stack([-n[:, 0] * p_rot_z + n[:, 2] * p_rot_x, n[:, 0], n[:, 2]])
+
+            huber_k = vox * 1.5
+            abs_r = np.abs(r_geom)
+            w_huber = np.where(abs_r <= huber_k, 1.0, huber_k / np.maximum(abs_r, 1e-6))
+
+            A_geom = (J_geom.T * w_huber) @ J_geom
+            b_geom = (J_geom.T * w_huber) @ (-r_geom)
+
+            if has_color and color_grad_r is not None and gray_s is not None and gray_r is not None:
+                g = color_grad_r[idxs[valid]]
+                r_col = gray_s[valid] - gray_r[idxs[valid]]
+                J_col = np.column_stack([-g[:, 0] * p_rot_z + g[:, 2] * p_rot_x, g[:, 0], g[:, 2]])
+                A_col = J_col.T @ J_col
+                b_col = J_col.T @ (-r_col)
+                A = 0.6 * A_geom + 0.4 * A_col
+                b = 0.6 * b_geom + 0.4 * b_col
+            else:
+                A = A_geom
+                b = b_geom
+
+            delta = np.linalg.solve(A + 1e-5 * np.eye(3), b)
+            curr_theta += delta[0]
+            curr_tx += delta[1]
+            curr_tz += delta[2]
+
+            if abs(delta[0]) < 1e-5 and math.hypot(delta[1], delta[2]) < 1e-5:
+                break
+
+    c_final = np.cos(curr_theta)
+    s_final = np.sin(curr_theta)
+    T_delta = np.array([
+        [c_final, 0.0, -s_final, curr_tx],
+        [0.0,     1.0,  0.0,     0.0],
+        [s_final, 0.0,  c_final, curr_tz],
+        [0.0,     0.0,  0.0,     1.0],
+    ], dtype=np.float64)
+
+    pts_final = (pts_src_orig @ T_delta[:3, :3].T) + T_delta[:3, 3]
+    dists_final, _ = tree_init.query(pts_final, k=1)
+    inliers = dists_final < distance_threshold_m
+    fitness = float(np.mean(inliers)) if len(dists_final) > 0 else 0.0
+    rmse_mm = (
+        float(np.sqrt(np.mean(dists_final[inliers] ** 2)) * 1000.0)
+        if np.any(inliers)
+        else 999.0
+    )
+
+    return T_delta, fitness, rmse_mm, rmse_before_mm
+
+
+def refine_with_keypoint_constraints(
+    curr_theta: float,
+    curr_tx: float,
+    curr_tz: float,
+    kpts_i: Optional[Keypoints3D],
+    kpts_j: Optional[Keypoints3D],
+    min_conf: float = 0.25,
+) -> Tuple[float, float, float, str]:
+    """
+    Pass 2: Refine yaw and horizontal translation using 3D keypoint distance residuals.
+    Constrains near-cylindrical torso surfaces using shoulders, hips, ears, and nose.
+
+    Returns:
+      (refined_theta, refined_tx, refined_tz, dominant_constraint: "icp" | "keypoints")
+    """
+    if kpts_i is None or kpts_j is None:
+        return curr_theta, curr_tx, curr_tz, "icp"
+
+    candidate_names = [
+        "left_shoulder",
+        "right_shoulder",
+        "left_hip",
+        "right_hip",
+        "left_ear",
+        "right_ear",
+        "nose",
+    ]
+    pts_i = []
+    pts_j = []
+    weights = []
+
+    for name in candidate_names:
+        pi, ci, vi = kpts_i.get(name)
+        pj, cj, vj = kpts_j.get(name)
+        if pi is not None and pj is not None and ci >= min_conf and cj >= min_conf:
+            w = float(min(ci * vi, cj * vj))
+            if w > 0.05:
+                pts_i.append(pi)
+                pts_j.append(pj)
+                weights.append(w)
+
+    if not pts_i:
+        return curr_theta, curr_tx, curr_tz, "icp"
+
+    theta = curr_theta
+    tx = curr_tx
+    tz = curr_tz
+
+    icp_w = 10.0
+
+    for _ in range(5):
+        c = np.cos(theta)
+        s = np.sin(theta)
+        R = np.array([[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]], dtype=np.float64)
+        t = np.array([tx, 0.0, tz], dtype=np.float64)
+
+        # Scale translation regularizer appropriately with meters vs radians
+        A = np.diag([icp_w, icp_w * 50.0, icp_w * 50.0])
+        b = -A @ np.array([theta - curr_theta, tx - curr_tx, tz - curr_tz], dtype=np.float64)
+
+        for pi, pj, w in zip(pts_i, pts_j, weights):
+            p_trans = R @ pi + t
+            rx = p_trans[0] - pj[0]
+            rz = p_trans[2] - pj[2]
+
+            p_rot_x = p_trans[0] - tx
+            p_rot_z = p_trans[2] - tz
+            Jx = np.array([-p_rot_z, 1.0, 0.0])
+            Jz = np.array([ p_rot_x, 0.0, 1.0])
+
+            kpt_scale = 500.0 * w
+            A += kpt_scale * (np.outer(Jx, Jx) + np.outer(Jz, Jz))
+            b += kpt_scale * (Jx * (-rx) + Jz * (-rz))
+
+        delta = np.linalg.solve(A + 1e-4 * np.eye(3), b)
+        theta += delta[0]
+        tx += delta[1]
+        tz += delta[2]
+        if abs(delta[0]) < 1e-5 and math.hypot(delta[1], delta[2]) < 1e-5:
+            break
+
+    yaw_shift_deg = float(np.rad2deg(abs(theta - curr_theta)))
+    dominant = "keypoints" if yaw_shift_deg > 0.5 else "icp"
+    return theta, tx, tz, dominant
+
+
+def _extract_rigid_clouds(
+    stop: AlignedStop,
+    cfg: FullBodyConfig,
+) -> Tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
+    """
+    Extract rigid body parts (head, torso, pelvis), excluding arms (ARM_PARTS).
+    Returns (pcd_cam_rigid, pcd_canon_rigid).
+    """
+    if stop.pcd_canonical is None or len(stop.pcd_canonical.points) == 0:
+        return o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
+
+    pts_canon = np.asarray(stop.pcd_canonical.points)
+    colors = np.asarray(stop.pcd_canonical.colors) if stop.pcd_canonical.has_colors() else None
+
+    # Apply rigid mask and arm exclusion mask
+    if stop.body_part_labels is not None and cfg.rigid_parts_only:
+        labels = stop.body_part_labels
+        rigid_mask = is_rigid_point(labels) & ~is_arm_point(labels)
+        if np.sum(rigid_mask) >= 50:
+            pts_canon = pts_canon[rigid_mask]
+            if colors is not None and len(colors) == len(labels):
+                colors = colors[rigid_mask]
+
+    pcd_canon_rigid = o3d.geometry.PointCloud()
+    pcd_canon_rigid.points = o3d.utility.Vector3dVector(pts_canon)
+    if colors is not None and len(colors) == len(pts_canon):
+        pcd_canon_rigid.colors = o3d.utility.Vector3dVector(colors)
+
+    # Transform back to camera coordinates
+    T_cam_canon = np.linalg.inv(stop.prior_T_canonical_camera)
+    pcd_cam_rigid = copy.deepcopy(pcd_canon_rigid).transform(T_cam_canon)
+
+    return pcd_cam_rigid, pcd_canon_rigid
+
+
 def _refine_alignment_multiview(
     aligned_stops: List[AlignedStop],
     cfg: FullBodyConfig,
+    raw_stops: Optional[List[StopData]] = None,
 ) -> None:
     """
-    Refine stop alignment via alternating MAP-style 4-DoF ICP against the combined rigid reference:
-    - Multi-start pose candidate initialization.
-    - Tangential sliding penalty on near-cylindrical surfaces.
-    - Prior term toward keypoint estimate.
-    - Bounded-recovery clamp logging and large residual flagging (NEEDS_REVIEW).
+    Multi-view pose-graph registration across stops:
+    1. Extract rigid body parts (head, torso, pelvis), excluding arms (ARM_PARTS).
+       NOTE: Per-limb articulated refinement for arms is not implemented here (known limitation).
+    2. Build PoseGraph with nodes = stops, initial poses = nominal canonical poses.
+    3. Register consecutive edges (i, i+1) and loop-closing edge (N-1, 0) via 3-parameter motion ICP
+       (yaw about vertical + XZ translation) followed by 3D keypoint constraint refinement.
+    4. Reject edges with low fitness or excessive yaw correction, falling back to nominal edge.
+    5. Information matrices from o3d.pipelines.registration.get_information_matrix_from_point_clouds.
+    6. Measure loop-closure error BEFORE optimization (residual of closing edge in deg and mm).
+    7. Global optimization (Levenberg-Marquardt) updates T_canonical_camera for every stop.
+    8. Record per-stop edge diagnostics: edge fitness, rmse mm, yaw correction deg, source ("icp"|"nominal").
     """
-    n_clamped = 0
-    for iteration in range(min(5, cfg.alignment_max_iterations)):
-        max_correction = 0.0
-        for i, stop in enumerate(aligned_stops):
-            if stop.pcd_canonical is None:
-                continue
+    n = len(aligned_stops)
+    if n < 2:
+        return
 
-            other_clouds = []
-            for j, other in enumerate(aligned_stops):
-                if i != j and other.pcd_canonical is not None:
-                    pts = np.asarray(other.pcd_canonical.points)
-                    if other.body_part_labels is not None and cfg.rigid_parts_only:
-                        rigid_mask = is_rigid_point(other.body_part_labels)
-                        if np.sum(rigid_mask) > 100:
-                            pts = pts[rigid_mask]
-                    cpcd = o3d.geometry.PointCloud()
-                    cpcd.points = o3d.utility.Vector3dVector(pts)
-                    other_clouds.append(cpcd)
+    # 1. Extract rigid clouds per stop
+    rigid_clouds_cam: List[o3d.geometry.PointCloud] = []
+    rigid_clouds_canon: List[o3d.geometry.PointCloud] = []
+    for s in aligned_stops:
+        p_cam, p_can = _extract_rigid_clouds(s, cfg)
+        rigid_clouds_cam.append(p_cam)
+        rigid_clouds_canon.append(p_can)
 
-            if not other_clouds:
-                continue
+    # 2. Define edge pairs: consecutive (i, i+1) and loop closing (N-1, 0) for N >= 3
+    if n == 2:
+        edge_pairs = [(0, 1)]
+    else:
+        edge_pairs = [(i, (i + 1) % n) for i in range(n)]
 
-            ref_pcd = other_clouds[0]
-            for c in other_clouds[1:]:
-                ref_pcd += c
+    edge_results: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
-            ref_pcd = ref_pcd.voxel_down_sample(0.01)
-            ref_pcd.estimate_normals()
+    for (i, j) in edge_pairs:
+        src_canon = rigid_clouds_canon[i]
+        tgt_canon = rigid_clouds_canon[j]
 
-            src_pts = np.asarray(stop.pcd_canonical.points)
-            if stop.body_part_labels is not None and cfg.rigid_parts_only:
-                rigid_m = is_rigid_point(stop.body_part_labels)
-                if np.sum(rigid_m) > 100:
-                    src_pts = src_pts[rigid_m]
-            src_pcd = o3d.geometry.PointCloud()
-            src_pcd.points = o3d.utility.Vector3dVector(src_pts)
-            src_pcd.estimate_normals()
-
-            # MAP-style 4-DoF ICP with multi-start and cylindrical sliding penalty
-            delta_T, inlier_frac, rmse_mm, rmse_before_mm, hit_clamp = _solve_4dof_map_icp(src_pcd, ref_pcd, cfg)
-
-            stop.residual_before_mm = rmse_before_mm
-            stop.residual_after_mm = rmse_mm
-            stop.inlier_fraction = inlier_frac
-
-            d_yaw = float(np.rad2deg(np.arctan2(delta_T[2, 0], delta_T[0, 0])))
-            d_trans = delta_T[:3, 3]
-
-            if not hit_clamp and inlier_frac >= cfg.alignment_min_inlier_fraction:
-                stop.T_canonical_camera = delta_T @ stop.T_canonical_camera
-                stop.pcd_canonical.transform(delta_T)
-                if stop.keypoints_canonical is not None:
-                    stop.keypoints_canonical = stop.keypoints_canonical.transform(delta_T, "canonical")
-                stop.refined_yaw_deg += d_yaw
-                stop.refined_translation_m += d_trans
-                max_correction = max(max_correction, abs(d_yaw))
-            else:
-                stop.hit_clamp = True
-                stop.review_status = "CLAMPED_PRIOR"
-                n_clamped += 1
-                logger.debug(f"  [align] Stop {stop.stop_id} ICP correction rejected by bounded recovery (clamped).")
-
-            # Check for large inter-stop residual
-            if stop.residual_after_mm > cfg.max_inter_stop_residual_mm:
-                stop.review_status = "NEEDS_REVIEW"
-                stop.accepted = False
-                logger.warning(
-                    f"  [align] Stop {stop.stop_id} flagged as NEEDS_REVIEW: residual "
-                    f"{stop.residual_after_mm:.1f} mm > {cfg.max_inter_stop_residual_mm:.1f} mm threshold."
-                )
-
-        if max_correction < 0.2:
-            break
-
-    if n_clamped > 0:
-        logger.info(f"  [align] Bounded recovery clamp triggered for {n_clamped} stop adjustment(s).")
-
-
-def _solve_4dof_map_icp(
-    src: o3d.geometry.PointCloud,
-    ref: o3d.geometry.PointCloud,
-    cfg: FullBodyConfig,
-) -> Tuple[np.ndarray, float, float, float, bool]:
-    """
-    Solve 4-DoF point-to-plane registration with MAP regularization:
-    1. Multi-start candidate initialization (test candidate yaw perturbations).
-    2. Point-to-plane ICP registration.
-    3. Tangential sliding damping on near-cylindrical torso surfaces.
-    4. Prior penalty toward keypoint estimate.
-    5. Bounded-recovery clamp check.
-    """
-    res_before = o3d.pipelines.registration.evaluate_registration(
-        src,
-        ref,
-        cfg.alignment_icp_distance_threshold_m,
-        np.eye(4),
-    )
-    rmse_before_mm = float(res_before.inlier_rmse * 1000.0)
-
-    # 1. Multi-start initialization: test candidates [0, -3, +3 deg]
-    candidate_yaws_deg = [0.0, -3.0, 3.0]
-    best_candidate_T = np.eye(4, dtype=np.float64)
-    best_candidate_fitness = float(res_before.fitness)
-
-    for cand_yaw in candidate_yaws_deg:
-        if abs(cand_yaw) < 1e-4:
+        if len(src_canon.points) < 20 or len(tgt_canon.points) < 20:
+            edge_results[(i, j)] = {
+                "T_delta": np.eye(4, dtype=np.float64),
+                "fitness": 0.0,
+                "rmse_mm": 999.0,
+                "rmse_before_mm": 999.0,
+                "yaw_corr": 0.0,
+                "source": "nominal",
+                "dominant": "nominal",
+                "accepted": False,
+                "reason": "Insufficient rigid points for ICP registration (<20 points)",
+            }
+            if j != 0:
+                aligned_stops[j].accepted = False
+                aligned_stops[j].review_status = "NEEDS_REVIEW"
+                aligned_stops[j].rejection_reason = edge_results[(i, j)]["reason"]
             continue
-        rad = np.deg2rad(cand_yaw)
-        c, s = np.cos(rad), np.sin(rad)
-        T_cand = np.eye(4, dtype=np.float64)
-        T_cand[:3, :3] = np.array([[c, 0, -s], [0, 1, 0], [s, 0, c]])
-        eval_cand = o3d.pipelines.registration.evaluate_registration(
-            src, ref, cfg.alignment_icp_distance_threshold_m, T_cand
+
+        T_delta_icp, fitness, rmse_mm, rmse_before_mm = solve_3param_point_to_plane_icp(
+            src_canon,
+            tgt_canon,
+            voxel_scales=(0.02, 0.01, 0.005),
+            distance_threshold_m=cfg.alignment_icp_distance_threshold_m,
         )
-        if eval_cand.fitness > best_candidate_fitness:
-            best_candidate_fitness = eval_cand.fitness
-            best_candidate_T = T_cand
 
-    # 2. Run Point-to-Plane ICP from best candidate
-    reg = o3d.pipelines.registration.registration_icp(
-        src,
-        ref,
-        cfg.alignment_icp_distance_threshold_m,
-        best_candidate_T,
-        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+        theta_icp = float(np.arctan2(T_delta_icp[2, 0], T_delta_icp[0, 0]))
+        tx_icp = float(T_delta_icp[0, 3])
+        tz_icp = float(T_delta_icp[2, 3])
+
+        # Pass 2: 3D keypoint refinement
+        theta_ref, tx_ref, tz_ref, dominant = refine_with_keypoint_constraints(
+            theta_icp,
+            tx_icp,
+            tz_icp,
+            aligned_stops[i].keypoints_canonical,
+            aligned_stops[j].keypoints_canonical,
+        )
+
+        c = np.cos(theta_ref)
+        s = np.sin(theta_ref)
+        T_delta = np.array([
+            [c,   0.0, -s,  tx_ref],
+            [0.0, 1.0,  0.0, 0.0],
+            [s,   0.0,  c,   tz_ref],
+            [0.0, 0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+        yaw_corr = float(np.rad2deg(abs(theta_ref)))
+
+        # Edge acceptance/rejection criteria (fitness and yaw bounds)
+        if fitness < cfg.alignment_min_inlier_fraction:
+            edge_accepted = False
+            rejection_reason = (
+                f"ICP fitness {fitness:.3f} < threshold {cfg.alignment_min_inlier_fraction:.2f}"
+            )
+        elif yaw_corr > cfg.alignment_max_yaw_correction_deg:
+            edge_accepted = False
+            rejection_reason = (
+                f"Yaw correction {yaw_corr:.1f} deg > threshold {cfg.alignment_max_yaw_correction_deg:.1f} deg"
+            )
+        else:
+            edge_accepted = True
+            rejection_reason = ""
+
+        if not edge_accepted:
+            T_delta = np.eye(4, dtype=np.float64)
+            edge_source = "nominal"
+            dominant = "nominal"
+            if j != 0:
+                aligned_stops[j].accepted = False
+                aligned_stops[j].review_status = "NEEDS_REVIEW"
+                aligned_stops[j].rejection_reason = rejection_reason
+        else:
+            edge_source = "icp"
+
+        edge_results[(i, j)] = {
+            "T_delta": T_delta,
+            "fitness": fitness,
+            "rmse_mm": rmse_mm,
+            "rmse_before_mm": rmse_before_mm,
+            "yaw_corr": yaw_corr,
+            "source": edge_source,
+            "dominant": dominant,
+            "accepted": edge_accepted,
+            "reason": rejection_reason,
+        }
+
+    # 3. Compute loop-closure error BEFORE optimization (closing edge residual)
+    if n >= 3 and (n - 1, 0) in edge_results:
+        T_chain = np.eye(4, dtype=np.float64)
+        for k in range(n - 1):
+            T_chain = edge_results[(k, k + 1)]["T_delta"] @ T_chain
+
+        T_closing = edge_results[(n - 1, 0)]["T_delta"]
+        T_loop = T_closing @ T_chain
+        R_loop = T_loop[:3, :3]
+        delta_theta_loop = float(np.rad2deg(np.arctan2(R_loop[2, 0], R_loop[0, 0])))
+        delta_t_loop_mm = float(math.hypot(T_loop[0, 3], T_loop[2, 3]) * 1000.0)
+
+        logger.info(
+            f"  [align] Loop-closure error before optimization: yaw {delta_theta_loop:.2f} deg, "
+            f"trans {delta_t_loop_mm:.1f} mm"
+        )
+        for s in aligned_stops:
+            s.loop_closure_residual_deg = delta_theta_loop
+            s.loop_closure_residual_mm = delta_t_loop_mm
+
+    # 4. Construct PoseGraph
+    pg = o3d.pipelines.registration.PoseGraph()
+    for s in aligned_stops:
+        pg.nodes.append(o3d.pipelines.registration.PoseGraphNode(s.prior_T_canonical_camera))
+
+    for (i, j) in edge_pairs:
+        res = edge_results[(i, j)]
+        T_i_init = aligned_stops[i].prior_T_canonical_camera
+        T_j_init = aligned_stops[j].prior_T_canonical_camera
+        T_delta = res["T_delta"]
+
+        # Relative transform mapping camera i -> camera j in Open3D PoseGraph convention:
+        # P_j = T_edge_cam @ P_i.
+        # Since T_delta aligns canonical cloud i to canonical cloud j: P_canon,j ~ T_delta @ P_canon,i
+        # target pose satisfies T_j = T_delta @ T_j_init, so T_edge = inv(T_j) @ T_i = inv(T_delta @ T_j_init) @ T_i_init.
+        T_edge_cam = np.linalg.inv(T_delta @ T_j_init) @ T_i_init
+
+        if res["source"] == "icp" and len(rigid_clouds_cam[i].points) >= 10 and len(rigid_clouds_cam[j].points) >= 10:
+            pcd_i_down = rigid_clouds_cam[i].voxel_down_sample(0.02)
+            pcd_j_down = rigid_clouds_cam[j].voxel_down_sample(0.02)
+            info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                pcd_i_down,
+                pcd_j_down,
+                cfg.alignment_icp_distance_threshold_m,
+                T_edge_cam,
+            )
+            if not np.all(np.isfinite(info)) or np.trace(info) < 1.0:
+                info = np.eye(6, dtype=np.float64) * 1.0
+            # Odometry chain is certain; loop-closing edge (N-1 -> 0) is uncertain
+            uncertain = (j == 0) or (not res["accepted"])
+        else:
+            info = np.eye(6, dtype=np.float64) * 1e-4
+            uncertain = True
+
+        pg.edges.append(o3d.pipelines.registration.PoseGraphEdge(i, j, T_edge_cam, info, uncertain=uncertain))
+
+    # 5. Global Levenberg-Marquardt optimization
+    option = o3d.pipelines.registration.GlobalOptimizationOption(
+        max_correspondence_distance=cfg.alignment_icp_distance_threshold_m,
+        edge_prune_threshold=0.25,
+        preference_loop_closure=0.1,
+        reference_node=0,
+    )
+    o3d.pipelines.registration.global_optimization(
+        pg,
+        o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+        o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+        option,
     )
 
-    # Project to 4-DoF
-    T = np.eye(4, dtype=np.float64)
-    R = reg.transformation[:3, :3]
-    yaw = np.arctan2(R[2, 0], R[0, 0])
-    cy, sy = np.cos(yaw), np.sin(yaw)
-    T[:3, :3] = np.array([
-        [cy, 0.0, -sy],
-        [0.0, 1.0, 0.0],
-        [sy, 0.0, cy],
-    ])
-    T[0, 3] = reg.transformation[0, 3]
-    T[1, 3] = 0.0
-    T[2, 3] = reg.transformation[2, 3]
+    # 6. Update stop poses and canonical geometries
+    for i in range(n):
+        s = aligned_stops[i]
+        T_opt = pg.nodes[i].pose
+        s.T_canonical_camera = T_opt
 
-    # 3. Penalize tangential sliding on near-cylindrical surfaces
-    # Estimate dominant normal direction in horizontal plane
-    if src.has_normals() and len(src.normals) > 10:
-        normals_np = np.asarray(src.normals)
-        nx = float(np.median(normals_np[:, 0]))
-        nz = float(np.median(normals_np[:, 2]))
-        norm_n = math.hypot(nx, nz)
-        if norm_n > 1e-3:
-            nx /= norm_n
-            nz /= norm_n
-            # Tangent direction is perpendicular to normal: (-nz, nx)
-            tx, tz = -nz, nx
-            trans_xz = np.array([T[0, 3], T[2, 3]])
-            tan_comp = trans_xz[0] * tx + trans_xz[1] * tz
-            # If sliding exceeds 5 mm, damp the tangential component
-            if abs(tan_comp) > 0.005:
-                damp_factor = 0.5  # Shrink unconstrained tangential sliding
-                T[0, 3] -= (1.0 - damp_factor) * tan_comp * tx
-                T[2, 3] -= (1.0 - damp_factor) * tan_comp * tz
+        # Canonical yaw: prior yaw updated by pose-graph optimized rotation
+        T_delta_opt = T_opt @ np.linalg.inv(s.prior_T_canonical_camera)
+        delta_yaw = float(np.rad2deg(np.arctan2(T_delta_opt[2, 0], T_delta_opt[0, 0])))
+        s.refined_yaw_deg = float((s.prior_yaw_deg + delta_yaw + 360.0) % 360.0)
+        s.refined_translation_m = T_opt[:3, 3].copy()
 
-    # 4. Check bounded recovery clamp
-    d_yaw_deg = float(np.rad2deg(abs(yaw)))
-    d_trans_m = float(math.hypot(T[0, 3], T[2, 3]))
+        # Update point cloud in canonical frame
+        if raw_stops and raw_stops[i].pcd is not None:
+            s.pcd_canonical = o3d.geometry.PointCloud(raw_stops[i].pcd)
+            s.pcd_canonical.transform(T_opt)
+        elif s.pcd_canonical is not None:
+            T_upd = T_opt @ np.linalg.inv(s.prior_T_canonical_camera)
+            s.pcd_canonical.transform(T_upd)
 
-    hit_clamp = (
-        d_yaw_deg > cfg.alignment_max_yaw_correction_deg or
-        d_trans_m > cfg.alignment_max_translation_correction_m or
-        float(reg.fitness) < cfg.alignment_min_inlier_fraction
-    )
+        # Update keypoints in canonical frame
+        if raw_stops and raw_stops[i].keypoints_camera is not None:
+            s.keypoints_canonical = raw_stops[i].keypoints_camera.transform(T_opt, "canonical")
+        elif s.keypoints_canonical is not None:
+            T_upd = T_opt @ np.linalg.inv(s.prior_T_canonical_camera)
+            s.keypoints_canonical = s.keypoints_canonical.transform(T_upd, "canonical")
 
-    inlier_frac = float(reg.fitness)
-    rmse_mm = float(reg.inlier_rmse * 1000.0)
-    return T, inlier_frac, rmse_mm, rmse_before_mm, hit_clamp
+        if s.pcd_canonical is not None and s.keypoints_canonical is not None:
+            s.body_part_labels = label_points_by_body_part(
+                np.asarray(s.pcd_canonical.points), s.keypoints_canonical, cfg
+            )
+
+        # Store edge diagnostics on stop
+        if i > 0:
+            diag = edge_results.get((i - 1, i))
+        else:
+            diag = edge_results.get((n - 1, 0)) or edge_results.get((0, 1))
+
+        if diag:
+            s.edge_fitness = diag["fitness"]
+            s.edge_rmse_mm = diag["rmse_mm"]
+            s.yaw_correction_deg = diag["yaw_corr"]
+            s.registration_source = diag["source"]
+            s.dominant_constraint = diag["dominant"]
+            s.residual_before_mm = diag["rmse_before_mm"]
+            s.residual_after_mm = diag["rmse_mm"]
+            s.inlier_fraction = diag["fitness"]
+            if diag["source"] == "icp":
+                s.accepted = True
+                s.review_status = "ACCEPTED"
+                if diag["rmse_mm"] > cfg.max_inter_stop_residual_mm:
+                    s.review_status = "NEEDS_REVIEW"
+
 

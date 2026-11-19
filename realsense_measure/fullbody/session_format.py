@@ -51,6 +51,26 @@ except Exception:
         return subject_id
 
 
+def warn_if_git_ignored(path: Union[str, Path]) -> bool:
+    """Check if the given path is git-ignored and log a warning if so."""
+    p = Path(path)
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["git", "check-ignore", "-q", str(p)],
+            capture_output=True,
+        )
+        if res.returncode == 0:
+            logger.warning(
+                f"Session destination '{p}' is git-ignored. "
+                "Full-body session captures should be tracked and persistent under raw_captures/<subject>/."
+            )
+            return True
+    except Exception:
+        pass
+    return False
+
+
 class AttemptHandle:
     """Handle to an open stop attempt directory."""
 
@@ -96,16 +116,20 @@ class SessionWriter:
         device_info: Optional[Dict[str, Any]] = None,
         software_version: str = "1.0.0",
         depth_units: Optional[str] = None,
+        turntable: bool = False,
+        background_dir: Optional[Union[str, Path]] = None,
     ):
         self.root = Path(root)
+        warn_if_git_ignored(self.root)
         self.subject_id = validate_anonymous_subject_id(subject_id)
         self.n_stops = int(n_stops)
+        self.turntable = bool(turntable)
         self.turn_direction = str(turn_direction).lower()
         if self.turn_direction not in ("cw", "ccw"):
             raise ValueError(f"Invalid turn_direction '{turn_direction}'. Must be 'cw' or 'ccw'.")
         self.camera_portrait_rotation = str(camera_portrait_rotation).lower()
-        if self.camera_portrait_rotation not in ("cw", "ccw"):
-            raise ValueError(f"Invalid camera_portrait_rotation '{camera_portrait_rotation}'. Must be 'cw' or 'ccw'.")
+        if self.camera_portrait_rotation not in ("cw", "ccw", "none"):
+            raise ValueError(f"Invalid camera_portrait_rotation '{camera_portrait_rotation}'. Must be 'cw', 'ccw', or 'none'.")
         if depth_units is not None and depth_units not in ("sensor_units", "m"):
             raise ValueError(f"Invalid depth_units '{depth_units}'. Must be 'sensor_units' or 'm'.")
         self.depth_units = depth_units
@@ -133,6 +157,28 @@ class SessionWriter:
         self.created_utc = datetime.now(timezone.utc).isoformat()
 
         self.root.mkdir(parents=True, exist_ok=True)
+
+        # Copy background session into session directory if provided
+        if background_dir is not None:
+            bg_p = Path(background_dir)
+            if bg_p.exists() and bg_p.is_dir():
+                target_bg = self.root / "background"
+                target_bg.mkdir(parents=True, exist_ok=True)
+                import shutil
+                for item in bg_p.iterdir():
+                    if item.is_file():
+                        shutil.copy2(item, target_bg / item.name)
+                # Ensure files.sha256 manifest exists for background
+                sha_file = target_bg / "files.sha256"
+                if not sha_file.exists():
+                    sha_map: Dict[str, str] = {}
+                    for f in sorted(target_bg.iterdir()):
+                        if f.is_file() and f.name != "files.sha256":
+                            sha_map[f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+                    with open(sha_file, "w", encoding="utf-8") as sf:
+                        for fname, h in sorted(sha_map.items()):
+                            sf.write(f"{h}  {fname}\n")
+
         self._finalized = False
         self._init_stops()
 
@@ -253,10 +299,16 @@ class SessionWriter:
             raise FileExistsError(f"Filtered depth already exists: {p}")
         np.save(str(p), filtered_depth)
 
-    def finish_attempt(self, handle: AttemptHandle, accepted: bool, reason: str = "") -> None:
+    def finish_attempt(
+        self,
+        handle: AttemptHandle,
+        accepted: bool,
+        reason: str = "",
+        sway_mm: Optional[float] = None,
+    ) -> None:
         """
         Mark an attempt as finished, compute SHA-256 for all files in attempt,
-        and update stop.json.
+        and update stop.json with attempt status, failure reason, and sway_mm.
         """
         if handle.is_finished:
             raise RuntimeError("Attempt is already finished.")
@@ -282,11 +334,13 @@ class SessionWriter:
             "attempt": handle.attempt_index,
             "status": "ACCEPTED" if accepted else "REJECTED",
             "reason": reason,
+            "sway_mm": round(float(sway_mm), 2) if sway_mm is not None else None,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
         stop_meta["attempts"].append(attempt_entry)
         if accepted:
             stop_meta["accepted_attempt"] = handle.attempt_index
+            stop_meta["accepted_sway_mm"] = round(float(sway_mm), 2) if sway_mm is not None else None
 
         with open(stop_json_path, "w", encoding="utf-8") as f:
             json.dump(stop_meta, f, indent=2)
@@ -320,8 +374,11 @@ class SessionWriter:
             "layout": "stops_v2",
             "subject_id": self.subject_id,
             "n_stops": self.n_stops,
+            "stop_count": self.n_stops,
             "turn_direction": self.turn_direction,
+            "turntable": getattr(self, "turntable", False),
             "camera_portrait_rotation": self.camera_portrait_rotation,
+            "camera_rotation": self.camera_portrait_rotation,
             "depth_scale": self.depth_scale,
             "depth_storage": {
                 "dtype": depth_storage_dtype,

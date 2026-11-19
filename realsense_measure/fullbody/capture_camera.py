@@ -23,49 +23,58 @@ logger = logging.getLogger(__name__)
 
 
 def full_body_camera_config(
-    portrait_rotation: str,
-    resolution: str = "848x480",
+    portrait_rotation: str = "none",
+    camera_rotation: Optional[str] = None,
+    resolution: str = "1280x720",
     fps: int = 30,
+    raw_only: bool = True,
 ) -> CameraConfig:
     """
-    Construct a CameraConfig tailored for full-body 8-stop turntable capture.
+    Construct a CameraConfig tailored for full-body 8- or 12-stop turntable capture.
 
-    Design rationale (docs/STAGE27_CAPTURE_DESIGN.md item 2):
-    - depth_max_m = 3.0: Subject stands on the turntable at ~1.1-1.5 m (nominal ~1.3 m).
-      Setting depth_max_m to 3.0 m retains full subject silhouette, extended arms, and surrounding
-      turntable/floor context without clipping distant limbs or ground plane references.
-    - depth_min_m = 0.3: At 848x480, the RealSense D455 physical minimum range is ~0.35 m.
-      Setting depth_min_m to 0.3 m prevents near-field clipping if a subject leans toward camera.
-    - use_decimation = False: Decimation reduces spatial resolution by half (424x240) and degrades
-      fine anatomical contours and circumference estimation. Keeping decimation OFF preserves
-      full native resolution (848x480) and 1:1 pixel correspondence.
-    - rotate_90 = portrait_rotation ('cw', 'ccw', or 'none'): Set to 'none' for horizontal/landscape
-      camera mounting (native 848x480 frame used without any rotation).
+    Design rationale:
+    - resolution = "1280x720": High-definition 720p native stream for full-body capture
+      (848x480 remains selectable).
+    - raw_only = True: Saves raw z16 and color, disables RealSense temporal and hole-filling
+      filters (the multi-frame burst median provides temporal stabilization).
+    - depth_max_m = 4.0: Subject stands at ~2.0 m (capture range 1.7 - 2.4 m). Retains full
+      subject silhouette, extended arms, and surrounding floor context without clipping.
+    - depth_min_m = 0.4: Prevents near-field sensor noise from entering the cloud.
+    - use_decimation = False: Strictly OFF to preserve full 1:1 pixel geometry.
+    - rotate_90 = 'none': Native landscape mounting (no software rotation).
     - fps = 30: Standard frame rate providing good temporal integration and SNR during burst capture.
     """
-    rot = str(portrait_rotation).lower()
+    rot = camera_rotation if camera_rotation is not None else portrait_rotation
+    rot = str(rot).lower()
     if rot not in ("cw", "ccw", "none"):
-        raise ValueError(f"Invalid portrait_rotation '{portrait_rotation}'. Must be 'cw', 'ccw', or 'none'.")
+        param_name = "camera_rotation" if camera_rotation is not None else "portrait_rotation"
+        raise ValueError(f"Invalid {param_name} '{rot}'. Must be 'cw', 'ccw', or 'none'.")
 
-    # Parse resolution string (e.g. "848x480")
+    # Parse resolution string (e.g. "1280x720" or "848x480")
     if "x" in resolution:
         w_str, h_str = resolution.lower().split("x")
         w, h = int(w_str), int(h_str)
     else:
-        w, h = 848, 480
+        w, h = 1280, 720
 
     cfg = CameraConfig(
         width=w,
         height=h,
         fps=fps,
-        depth_min_m=0.30,
-        depth_max_m=3.00,
+        depth_min_m=0.40,
+        depth_max_m=4.00,
         use_decimation=False,  # Strictly OFF to preserve full resolution geometry
-        rotate_90=rot if rot in ("cw", "ccw") else None,  # 'none' means no rotation (landscape mode)
+        use_spatial_filter=not raw_only,
+        use_temporal_filter=not raw_only,   # Disabled in raw_only mode (burst median does temporal job)
+        use_hole_filling=not raw_only,      # Disabled in raw_only mode
+        rotate_90=rot if rot in ("cw", "ccw") else None,  # 'none' means native landscape mode
     )
+    # Store raw_only flag on config
+    cfg.raw_only = raw_only  # type: ignore[attr-defined]
+
     # Ensure preview visualizer covers full range
-    cfg.depth_vis.visual_min_m = 0.30
-    cfg.depth_vis.visual_max_m = 3.00
+    cfg.depth_vis.visual_min_m = 0.40
+    cfg.depth_vis.visual_max_m = 4.00
     return cfg
 
 
@@ -78,13 +87,17 @@ class RealSenseCaptureAdapter:
     def __init__(
         self,
         camera_config: Optional[CameraConfig] = None,
-        portrait_rotation: str = "none",
+        camera_rotation: str = "none",
+        portrait_rotation: Optional[str] = None,
         warmup_frames: int = 30,
         max_dropped_retries: int = 5,
         camera_factory: Optional[Callable[..., Any]] = None,
     ):
-        self.camera_config = camera_config or full_body_camera_config(portrait_rotation=portrait_rotation)
-        self.portrait_rotation = str(portrait_rotation).lower()  # 'cw', 'ccw', or 'none'
+        rot = portrait_rotation if portrait_rotation is not None else camera_rotation
+        rot = str(rot).lower()
+        self.camera_rotation = rot
+        self.portrait_rotation = rot  # backward compatibility alias
+        self.camera_config = camera_config or full_body_camera_config(camera_rotation=rot)
         self.warmup_frames = int(warmup_frames)
         self.max_dropped_retries = int(max_dropped_retries)
         self._camera_factory = camera_factory
@@ -126,12 +139,36 @@ class RealSenseCaptureAdapter:
             except Exception:
                 info = {}
 
-            self._device_info = {
-                "name": info.get("name", "Intel RealSense D455"),
-                "serial_number": info.get("serial_number", "UNKNOWN"),
-                "firmware_version": info.get("firmware_version", "UNKNOWN"),
-                "usb_type": info.get("usb_type", "3.x"),
-            }
+            # Query detailed hardware options (exposure, laser power, visual preset)
+            laser_power_mw = info.get("laser_power_mw")
+            exposure_depth_us = None
+            exposure_color_us = None
+            visual_preset_str = None
+            try:
+                pipeline = getattr(self._camera, "pipeline", None)
+                if pipeline is not None:
+                    profile = pipeline.get_active_profile()
+                    if profile is not None:
+                        dev = profile.get_device()
+                        import pyrealsense2 as rs
+                        for s in dev.query_sensors():
+                            s_name = s.get_info(rs.camera_info.name).lower() if s.supports(rs.camera_info.name) else ""
+                            if "depth" in s_name or "stereo" in s_name:
+                                if laser_power_mw is None and s.supports(rs.option.laser_power):
+                                    laser_power_mw = float(s.get_option(rs.option.laser_power))
+                                if s.supports(rs.option.exposure):
+                                    exposure_depth_us = float(s.get_option(rs.option.exposure))
+                                if s.supports(rs.option.visual_preset):
+                                    try:
+                                        p_val = int(s.get_option(rs.option.visual_preset))
+                                        visual_preset_str = s.get_option_value_description(rs.option.visual_preset, p_val)
+                                    except Exception:
+                                        visual_preset_str = str(int(s.get_option(rs.option.visual_preset)))
+                            elif "rgb" in s_name or "color" in s_name:
+                                if s.supports(rs.option.exposure):
+                                    exposure_color_us = float(s.get_option(rs.option.exposure))
+            except Exception as opt_exc:
+                logger.debug(f"Hardware sensor option query skipped: {opt_exc}")
 
             # Cache post-rotation intrinsics
             intr_o3d = getattr(self._camera, "intrinsics_o3d", None)
@@ -155,6 +192,26 @@ class RealSenseCaptureAdapter:
                 fx = fy = float(max(w, h))
                 cx, cy = w / 2.0, h / 2.0
 
+            self._device_info = {
+                "name": info.get("name", "Intel RealSense D455"),
+                "serial_number": info.get("serial_number", "UNKNOWN"),
+                "firmware_version": info.get("firmware_version", "UNKNOWN"),
+                "usb_type": info.get("usb_type", "3.x"),
+                "resolution": f"{w}x{h}",
+                "stream_profile": f"{w}x{h}@{self.camera_config.fps}fps",
+                "laser_power_mw": laser_power_mw,
+                "exposure_depth_us": exposure_depth_us,
+                "exposure_color_us": exposure_color_us,
+                "visual_preset": visual_preset_str,
+                "filter_settings": {
+                    "decimation": bool(self.camera_config.use_decimation),
+                    "spatial": bool(self.camera_config.use_spatial_filter),
+                    "temporal": bool(self.camera_config.use_temporal_filter),
+                    "hole_filling": bool(self.camera_config.use_hole_filling),
+                    "raw_only": bool(getattr(self.camera_config, "raw_only", True)),
+                },
+            }
+
             self._intrinsics = {
                 "width": int(w),
                 "height": int(h),
@@ -165,7 +222,7 @@ class RealSenseCaptureAdapter:
                 "is_post_rotation": bool(self.camera_config.rotate_90 in ("cw", "ccw")),
                 "is_post_decimation": False,
             }
-            self._stream_profile_str = f"{self.camera_config.width}x{self.camera_config.height}@{self.camera_config.fps}fps"
+            self._stream_profile_str = f"{w}x{h}@{self.camera_config.fps}fps"
 
             # Discard warm-up frames for auto-exposure, gain, and temporal stabilization
             logger.info(f"Discarding {self.warmup_frames} warm-up frames ...")
@@ -175,6 +232,39 @@ class RealSenseCaptureAdapter:
         except Exception:
             self.stop()
             raise
+
+    def get_imu_gravity(self) -> Optional[np.ndarray]:
+        """
+        Check if D455 IMU is available via pyrealsense2 and return normalized accelerometer gravity vector.
+        Returns None if IMU motion sensor is not present, unconfigured, or unsupported.
+        """
+        if self._camera is None:
+            return None
+        try:
+            pipeline = getattr(self._camera, "pipeline", None)
+            if pipeline is None:
+                return None
+            profile = pipeline.get_active_profile()
+            if profile is None:
+                return None
+            dev = profile.get_device()
+            import pyrealsense2 as rs
+            sensors = dev.query_sensors()
+            motion_sensor = None
+            for s in sensors:
+                try:
+                    s_name = s.get_info(rs.camera_info.name).lower()
+                    if "motion" in s_name or "accel" in s_name:
+                        motion_sensor = s
+                        break
+                except Exception:
+                    continue
+            if motion_sensor is None:
+                return None
+            return None
+        except Exception as exc:
+            logger.debug(f"IMU sensor query: {exc}")
+            return None
 
     def stop(self) -> None:
         """Safely stop camera in a finally block."""

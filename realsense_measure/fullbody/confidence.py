@@ -143,7 +143,9 @@ def compute_confidence_map(
     # Dot product of normal with view ray (ray points away from camera, normal towards)
     cos_theta = -np.sum(normals * view_rays, axis=2)
     cos_theta = np.clip(cos_theta, 0.0, 1.0)
-    w_angle = np.power(cos_theta, cfg.incidence_angle_power).astype(np.float32)
+    # Incidence-angle term floored at 0.3 on valid surfaces (down-weights grazing surfaces without deleting them)
+    raw_w_angle = np.power(cos_theta, cfg.incidence_angle_power).astype(np.float32)
+    w_angle = np.where(valid, np.maximum(0.3, raw_w_angle), 0.0).astype(np.float32)
 
     # 2. Distance to depth edge factor:
     # Silhouette jump edges (> 5 cm step between adjacent valid pixels, or image borders).

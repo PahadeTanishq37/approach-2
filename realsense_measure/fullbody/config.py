@@ -21,14 +21,26 @@ class FullBodyConfig:
     # -------------------------------------------------------------------------
     # Protocol & Stops
     # -------------------------------------------------------------------------
-    num_stops: int = 8
-    expected_step_deg: float = 45.0
+    stop_count: int = 8                          # 8 or 12 stops (360 / stop_count nominal step)
+    num_stops: int = 8                           # backward compatibility alias for stop_count
+    expected_step_deg: float = 45.0              # 360.0 / stop_count
     turn_direction: str = "cw"                   # "cw" (clockwise from above) or "ccw"
-    camera_portrait_rotation: str = "cw"         # "cw" (90 deg clockwise) or "ccw" (90 deg counter-clockwise)
+    turntable: bool = False                      # True if subject stands on automated/manual turntable
+    resolution: str = "1280x720"                 # "1280x720" (full-body default) or "848x480"
+    camera_rotation: str = "none"                # "none" (native landscape), "cw", or "ccw"
+    camera_portrait_rotation: str = "none"       # alias for backward compatibility
     max_angle_deviation_deg: float = 25.0
-    burst_frame_count: int = 30
-    camera_height_m: float = 0.90
-    camera_distance_m: float = 1.30
+    burst_frame_count: int = 15                  # 15 frames per stop burst (default)
+    motion_limit_mm: float = 10.0                # 10 mm sway limit enforced during burst
+    max_retakes: int = 3                         # max retakes per stop
+    raw_only: bool = True                        # save raw z16/color, disable HW temporal/hole filters
+    camera_height_m: float = 0.95                # UNUSED: dynamically taken from fitted floor plane (abs(floor.coefficients[3]))
+    camera_distance_m: float = 2.00
+    capture_dist_min_m: float = 1.70
+    capture_dist_max_m: float = 2.40
+    capture_range_min_m: float = 1.70            # backward compatibility alias
+    capture_range_max_m: float = 2.40            # backward compatibility alias
+    expected_intrinsics: Optional[Dict[str, float]] = None  # Expected active stream intrinsics {width, height, fx, fy, cx, cy}
 
     # -------------------------------------------------------------------------
     # Burst processing
@@ -38,7 +50,7 @@ class FullBodyConfig:
     hole_fill_max_radius_px: int = 3
     temporal_std_outlier_sigma: float = 3.0
     depth_min_m: float = 0.40
-    depth_max_m: float = 2.60
+    depth_max_m: float = 4.00
 
     # -------------------------------------------------------------------------
     # Floor detection
@@ -52,11 +64,11 @@ class FullBodyConfig:
     # -------------------------------------------------------------------------
     # Confidence weighting
     # -------------------------------------------------------------------------
-    min_confidence_threshold: float = 0.08
+    min_confidence_threshold: float = 0.05
     incidence_angle_power: float = 2.0
     edge_distance_falloff_px: float = 8.0  # increased from 5 → 8 px: makes ring coverage robust to sensor noise at body edges
-    noise_sigma_base_m: float = 0.001            # 1 mm at 0.6 m
-    noise_reference_distance_m: float = 0.60
+    noise_sigma_base_m: float = 0.0015           # 1.5 mm at 1.0 m (sigma_z = 0.0015 * (z / 1.0)^2)
+    noise_reference_distance_m: float = 1.00
 
     # -------------------------------------------------------------------------
     # 3D Keypoints & Skeletal Estimation
@@ -86,12 +98,8 @@ class FullBodyConfig:
     alignment_max_iterations: int = 15
     alignment_convergence_eps: float = 1e-4
     alignment_min_inlier_fraction: float = 0.40
-    arm_refinement_max_rotation_deg: float = 20.0
-    arm_refinement_max_translation_m: float = 0.05
     rigid_parts_only: bool = True
     body_axis_drift_sigma_m: float = 0.02
-    icp_prior_weight: float = 0.5
-    icp_tangent_penalty_weight: float = 2.0
     max_inter_stop_residual_mm: float = 15.0
 
     # -------------------------------------------------------------------------
@@ -99,7 +107,7 @@ class FullBodyConfig:
     # -------------------------------------------------------------------------
     tsdf_voxel_length_m: float = 0.005  # 5 mm
     tsdf_sdf_trunc_m: float = 0.020     # 20 mm (4x voxel)
-    tsdf_depth_trunc_m: float = 2.50
+    tsdf_depth_trunc_m: float = 4.00
     min_mesh_component_ratio: float = 0.02
     keep_dominant_mesh_component: bool = False
 
@@ -121,6 +129,11 @@ class FullBodyConfig:
     arap_regularization_weight: float = 50.0
 
     # -------------------------------------------------------------------------
+    # Background & Calibration Assets
+    # -------------------------------------------------------------------------
+    background_dir: Path = field(default_factory=lambda: Path("raw_captures/background"))
+
+    # -------------------------------------------------------------------------
     # Output & Diagnostics
     # -------------------------------------------------------------------------
     output_dir: Path = field(default_factory=lambda: Path("scan_output/fullbody"))
@@ -132,9 +145,38 @@ class FullBodyConfig:
             raise ValueError(
                 f"Invalid turn_direction '{self.turn_direction}'. Must be 'cw' or 'ccw'."
             )
-        if self.camera_portrait_rotation not in ("cw", "ccw"):
+
+        # Synchronize stop_count and num_stops
+        if self.stop_count not in (8, 12):
+            if self.num_stops in (8, 12):
+                self.stop_count = self.num_stops
+            else:
+                raise ValueError(f"Invalid stop_count {self.stop_count}. Must be 8 or 12.")
+        self.num_stops = self.stop_count
+        self.expected_step_deg = 360.0 / float(self.stop_count)
+
+        # Resolution validation
+        res_norm = str(self.resolution).lower().strip()
+        if res_norm not in ("1280x720", "848x480"):
+            raise ValueError(f"Invalid resolution '{self.resolution}'. Must be '1280x720' or '848x480'.")
+        self.resolution = res_norm
+
+        # Synchronize camera_rotation and camera_portrait_rotation
+        if self.camera_rotation != "none" and self.camera_portrait_rotation == "none":
+            self.camera_portrait_rotation = self.camera_rotation
+        elif self.camera_portrait_rotation != "none" and self.camera_rotation == "none":
+            self.camera_rotation = self.camera_portrait_rotation
+
+        if self.camera_rotation not in ("cw", "ccw", "none"):
             raise ValueError(
-                f"Invalid camera_portrait_rotation '{self.camera_portrait_rotation}'. Must be 'cw' or 'ccw'."
+                f"Invalid camera_rotation '{self.camera_rotation}'. Must be 'cw', 'ccw', or 'none'."
             )
+        if self.camera_portrait_rotation not in ("cw", "ccw", "none"):
+            raise ValueError(
+                f"Invalid camera_portrait_rotation '{self.camera_portrait_rotation}'. Must be 'cw', 'ccw', or 'none'."
+            )
+
+        self.capture_range_min_m = self.capture_dist_min_m
+        self.capture_range_max_m = self.capture_dist_max_m
 
 

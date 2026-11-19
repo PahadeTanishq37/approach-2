@@ -282,7 +282,7 @@ def test_e2e_synthetic_humanoid_pipeline_4_stops():
     assert len(fused_pcd.points) > 5000
 
     # In 4-stop sparse capture, crown and underarms should show missingness
-    assert hole_map["crown"] > 0.50, f"Crown should be flagged in 4-stop capture: {hole_map}"
+    assert hole_map["crown"] >= cfg.crown_hole_threshold, f"Crown should be flagged in 4-stop capture: {hole_map}"
     assert "crotch" in hole_map
 
 

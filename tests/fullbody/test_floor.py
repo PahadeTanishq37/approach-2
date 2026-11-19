@@ -16,11 +16,97 @@ import pytest
 
 from realsense_measure.fullbody.config import FullBodyConfig
 from realsense_measure.fullbody.floor import (
+    build_gravity_rotation,
     compute_rotation_aligning_vectors,
     fit_floor_plane,
     verify_floor_consistency,
 )
 from realsense_measure.fullbody.types import FloorPlane
+
+
+def test_build_gravity_rotation_properties():
+    """Verify build_gravity_rotation gives proper right-handed rotation and diag(-1,-1,1) for level camera."""
+    up_cam_level = np.array([0.0, -1.0, 0.0])
+    R_level = build_gravity_rotation(up_cam_level)
+
+    # Must give diag(-1, -1, 1)
+    expected_level = np.diag([-1.0, -1.0, 1.0])
+    assert np.allclose(R_level, expected_level, atol=1e-6)
+    assert np.isclose(np.linalg.det(R_level), 1.0, atol=1e-6)
+
+    # Floor normal maps to +Y
+    assert np.allclose(R_level @ up_cam_level, [0.0, 1.0, 0.0], atol=1e-6)
+
+    # Camera forward maps to +Z
+    fwd_mapped = R_level @ np.array([0.0, 0.0, 1.0])
+    assert np.allclose(fwd_mapped, [0.0, 0.0, 1.0], atol=1e-6)
+
+
+def test_build_gravity_rotation_real_fixture():
+    """Verify real hardware floor normal fixture does not produce anomalous heading."""
+    # Real normal fixture from hardware test: normal=(0.0198, -0.9995, 0.0227)
+    normal = np.array([0.019771375569192753, -0.999546910305076, 0.022695083337107794])
+    R = build_gravity_rotation(normal)
+
+    # det(R) = +1
+    assert np.isclose(np.linalg.det(R), 1.0, atol=1e-6)
+
+    # R @ normal = +Y
+    normal_unit = normal / np.linalg.norm(normal)
+    mapped_n = R @ normal_unit
+    assert np.allclose(mapped_n, [0.0, 1.0, 0.0], atol=1e-6)
+
+    # Camera forward maps to +Z within 1 deg azimuth
+    fwd_cam = np.array([0.0, 0.0, 1.0])
+    fwd_mapped = R @ fwd_cam
+    azimuth_deg = float(np.rad2deg(np.arctan2(fwd_mapped[0], fwd_mapped[2])))
+    assert abs(azimuth_deg) < 1.0, f"Forward azimuth {azimuth_deg:.2f} deg must be within 1 deg"
+    assert fwd_mapped[2] > 0.99, "Forward vector must point along +Z"
+
+
+def test_build_gravity_rotation_pitch_roll_sweep():
+    """Verify all pitch/roll combinations in [-15..15 deg] satisfy det=1, R@n=+Y, azimuth<1deg, Y=0."""
+    def rot_x(rad):
+        c, s = np.cos(rad), np.sin(rad)
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+    def rot_z(rad):
+        c, s = np.cos(rad), np.sin(rad)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    pitch_vals = np.linspace(-15.0, 15.0, 7)
+    roll_vals = np.linspace(-15.0, 15.0, 7)
+
+    for p_deg in pitch_vals:
+        for r_deg in roll_vals:
+            R_cam = rot_x(np.deg2rad(p_deg)) @ rot_z(np.deg2rad(r_deg))
+            # Level camera up is [0, -1, 0]; tilted camera up:
+            up_cam = R_cam.T @ np.array([0.0, -1.0, 0.0])
+            up_cam /= np.linalg.norm(up_cam)
+
+            R_g = build_gravity_rotation(up_cam)
+
+            # 1. det(R) == +1
+            assert np.isclose(np.linalg.det(R_g), 1.0, atol=1e-6)
+
+            # 2. R @ n == +Y
+            assert np.allclose(R_g @ up_cam, [0.0, 1.0, 0.0], atol=1e-6)
+
+            # 3. Camera forward maps to +Z within 1 deg azimuth
+            fwd_mapped = R_g @ np.array([0.0, 0.0, 1.0])
+            azimuth_deg = float(np.rad2deg(np.arctan2(fwd_mapped[0], fwd_mapped[2])))
+            assert abs(azimuth_deg) < 1.0, f"Pitch {p_deg}, roll {r_deg}: azimuth {azimuth_deg} deg >= 1 deg"
+            assert fwd_mapped[2] > 0.9, f"Pitch {p_deg}, roll {r_deg}: forward Z {fwd_mapped[2]} <= 0.9"
+
+            # 4. Floor point maps to Y = 0 under T_grav_cam
+            # Floor plane at height 1.2 m below camera
+            p_floor_cam = R_cam.T @ np.array([0.3, 1.2, 2.0])
+            p0_cam = R_cam.T @ np.array([0.0, 1.2, 0.0])
+            # T_grav_cam translation is -R_g @ p0_cam
+            t_grav = -R_g @ p0_cam
+            p_grav = R_g @ p_floor_cam + t_grav
+            assert np.isclose(p_grav[1], 0.0, atol=1e-5), f"Pitch {p_deg}, roll {r_deg}: floor Y={p_grav[1]} != 0"
+
 
 
 def test_floor_plane_ransac_and_gravity_alignment():

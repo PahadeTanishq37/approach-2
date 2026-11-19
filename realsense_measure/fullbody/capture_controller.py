@@ -10,7 +10,7 @@ No sleeping, no UI rendering (cv2.imshow), and no stdin input() inside the contr
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 import logging
@@ -65,24 +65,24 @@ class CaptureThresholds:
     Comments distinguish existing defaults from new/untested Stage 27 thresholds.
     """
 
-    # Existing default: FullBodyConfig.burst_frame_count (fullbody/config.py:29)
-    burst_frames: int = 30
+    # Burst frame count: default 15 frames
+    burst_frames: int = 15
 
-    # NEW/UNTESTED: Maximum retake attempts allowed per stop before aborting
+    # Maximum retake attempts allowed per stop before aborting
     max_retakes: int = 3
 
-    # NEW/UNTESTED: Consecutive frames required under motion limit to trigger capture (approx 0.5 s @ 30 fps)
-    stillness_frames: int = 15
+    # Consecutive frames required under motion limit to trigger capture (2.0 s @ 30 fps = 60 frames)
+    stillness_frames: int = 60
 
-    # Existing default: capture_motion.DEFAULT_STILLNESS_THRESHOLD_MM (capture_motion.py:33)
+    # Motion/sway limit in mm (enforced at 10.0 mm)
     motion_limit_mm: float = 10.0
 
     # Existing default: capture_session.CaptureQualityChecker.depth_valid_frac_threshold (capture_session.py:364)
     valid_depth_fraction: float = 0.30
 
-    # NEW/UNTESTED: Acceptable median body depth distance window [1.10, 1.50] m
-    dist_min_m: float = 1.10
-    dist_max_m: float = 1.50
+    # Acceptable subject standoff window [capture_dist_min_m, capture_dist_max_m] from FullBodyConfig
+    dist_min_m: float = field(default_factory=lambda: FullBodyConfig().capture_dist_min_m)
+    dist_max_m: float = field(default_factory=lambda: FullBodyConfig().capture_dist_max_m)
 
     # NEW/UNTESTED: Require head (top border) and feet (bottom border) to remain unclipped
     require_head_feet: bool = True
@@ -121,12 +121,15 @@ def default_quality_fn(
     depth_scale: float = 1.0,
     depth_units: str = "m",
     thresholds: Optional[CaptureThresholds] = None,
+    bg_depth: Optional[np.ndarray] = None,
+    cfg: Optional[FullBodyConfig] = None,
+    intrinsics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Numpy-only quality assessment for a captured burst:
     - Valid depth fraction in central ROI
     - Temporal depth standard deviation (mm)
-    - Max inter-frame centroid shift (mm)
+    - Sway: median per-frame shift of the foreground centroid and torso-region depth (mm)
     - Border-touch fraction and clipping diagnostics
     """
     th = thresholds or CaptureThresholds()
@@ -137,6 +140,7 @@ def default_quality_fn(
             "reasons": [
                 f"Burst frame count ({n_frames}) is less than required burst_frames ({th.burst_frames})"
             ],
+            "sway_mm": 999.0,
             "motion_mm": 999.0,
             "temporal_depth_std_mm": 999.0,
             "valid_depth_fraction": 0.0,
@@ -159,33 +163,36 @@ def default_quality_fn(
     r_x0, r_x1 = int(0.20 * w), int(0.80 * w)
 
     valid_fractions: List[float] = []
-    centroids: List[Tuple[float, float, float]] = []
     border_touch_fractions: List[float] = []
     head_clipped_count = 0
     feet_clipped_count = 0
 
+    # 1. Compute sway as the median per-frame shift of the foreground centroid
+    # and torso-region depth (using compute_foreground_mask against background session)
+    from realsense_measure.fullbody.fusion import compute_foreground_mask
+    cfg_eval = cfg or FullBodyConfig()
+
+    fx = float(intrinsics.get("fx", max(h, w))) if intrinsics else float(max(h, w))
+    fy = float(intrinsics.get("fy", max(h, w))) if intrinsics else float(max(h, w))
+    cx = float(intrinsics.get("cx", w / 2.0)) if intrinsics else float(w / 2.0)
+    cy = float(intrinsics.get("cy", h / 2.0)) if intrinsics else float(h / 2.0)
+
+    per_frame_centroids: List[Tuple[float, float, float]] = []
+    per_frame_torso_z: List[float] = []
+
+    m_y = max(1, int(0.02 * h))
+    m_x = max(1, int(0.02 * w))
+    border_mask = np.zeros((h, w), dtype=bool)
+    border_mask[:m_y, :] = True
+    border_mask[-m_y:, :] = True
+    border_mask[:, :m_x] = True
+    border_mask[:, -m_x:] = True
+
     for d_m in depth_m_list:
-        valid_mask = (d_m > 0.3) & (d_m < 3.5)
+        valid_mask = (d_m > 0.3) & (d_m < 3.8)
         roi_mask = valid_mask[r_y0:r_y1, r_x0:r_x1]
         roi_valid_frac = float(np.count_nonzero(roi_mask)) / float(roi_mask.size)
         valid_fractions.append(roi_valid_frac)
-
-        # 3D Centroid (row, col, depth)
-        ys, xs = np.nonzero(valid_mask)
-        if len(ys) > 100:
-            zs = d_m[ys, xs]
-            centroids.append((float(np.mean(xs)), float(np.mean(ys)), float(np.mean(zs))))
-        else:
-            centroids.append((w / 2.0, h / 2.0, 0.0))
-
-        # Border clipping: pixels within margin (2% border)
-        m_y = max(1, int(0.02 * h))
-        m_x = max(1, int(0.02 * w))
-        border_mask = np.zeros_like(valid_mask, dtype=bool)
-        border_mask[:m_y, :] = True
-        border_mask[-m_y:, :] = True
-        border_mask[:, :m_x] = True
-        border_mask[:, -m_x:] = True
 
         total_valid = np.count_nonzero(valid_mask)
         if total_valid > 0:
@@ -200,9 +207,59 @@ def default_quality_fn(
         if np.any(valid_mask[-m_y:, :]):
             feet_clipped_count += 1
 
+        # Foreground mask via background subtraction if background is available
+        if bg_depth is not None and bg_depth.shape[:2] == (h, w):
+            fg_m = compute_foreground_mask(d_m, bg_depth, cfg_eval)
+        else:
+            med_z = float(np.median(d_m[valid_mask])) if total_valid > 50 else 2.0
+            fg_m = valid_mask & (np.abs(d_m - med_z) < 0.45)
+
+        ys, xs = np.nonzero(fg_m)
+        if len(ys) > 50:
+            u_c = float(np.mean(xs))
+            v_c = float(np.mean(ys))
+            z_c = float(np.median(d_m[ys, xs]))
+            x_m = (u_c - cx) * (z_c / fx)
+            y_m = (v_c - cy) * (z_c / fy)
+            per_frame_centroids.append((x_m, y_m, z_c))
+
+            # Torso: 20% to 65% vertical span, central 60% horizontal span
+            y_min, y_max = int(np.min(ys)), int(np.max(ys))
+            x_min, x_max = int(np.min(xs)), int(np.max(xs))
+            span_h = max(10, y_max - y_min)
+            span_w = max(10, x_max - x_min)
+            t_y0 = y_min + int(0.20 * span_h)
+            t_y1 = y_min + int(0.65 * span_h)
+            t_x0 = x_min + int(0.20 * span_w)
+            t_x1 = x_min + int(0.80 * span_w)
+            torso_sub = d_m[t_y0:t_y1, t_x0:t_x1]
+            torso_val = torso_sub[(torso_sub > 0.4) & (torso_sub < 3.8)]
+            if len(torso_val) > 20:
+                per_frame_torso_z.append(float(np.median(torso_val)))
+            else:
+                per_frame_torso_z.append(z_c)
+        else:
+            per_frame_centroids.append((0.0, 0.0, 0.0))
+            per_frame_torso_z.append(0.0)
+
+    # Compute consecutive per-frame shifts (sway)
+    per_frame_shifts_mm: List[float] = []
+    if len(per_frame_centroids) > 1:
+        for i in range(len(per_frame_centroids) - 1):
+            c0 = per_frame_centroids[i]
+            c1 = per_frame_centroids[i + 1]
+            dx_mm = (c1[0] - c0[0]) * 1000.0
+            dy_mm = (c1[1] - c0[1]) * 1000.0
+            dz_torso_mm = (per_frame_torso_z[i + 1] - per_frame_torso_z[i]) * 1000.0
+            shift_mm = float(np.sqrt(dx_mm**2 + dy_mm**2 + dz_torso_mm**2))
+            per_frame_shifts_mm.append(shift_mm)
+        sway_mm = float(np.median(per_frame_shifts_mm))
+    else:
+        sway_mm = 0.0
+
     # Temporal depth std in mm across stack
     depth_stack = np.stack(depth_m_list, axis=0)
-    valid_stack = (depth_stack > 0.3) & (depth_stack < 3.5)
+    valid_stack = (depth_stack > 0.3) & (depth_stack < 3.8)
     valid_count_per_pix = np.sum(valid_stack, axis=0)
     stable_pix = valid_count_per_pix >= max(3, int(0.5 * n_frames))
 
@@ -213,33 +270,15 @@ def default_quality_fn(
     else:
         median_depth_std_mm = 999.0
 
-    # Max centroid displacement in mm
-    if len(centroids) > 1:
-        c_arr = np.array(centroids)  # (N, 3) in (x_px, y_px, z_m)
-        # Approximate metric scale in x/y from median depth
-        med_z = float(np.median(c_arr[:, 2]))
-        if med_z > 0.2:
-            # Assume nominal fx, fy approx max(h, w) for pixel-to-mm displacement
-            focal = float(max(h, w))
-            dx_mm = (c_arr[:, 0] - np.mean(c_arr[:, 0])) * (med_z / focal) * 1000.0
-            dy_mm = (c_arr[:, 1] - np.mean(c_arr[:, 1])) * (med_z / focal) * 1000.0
-            dz_mm = (c_arr[:, 2] - np.mean(c_arr[:, 2])) * 1000.0
-            displacements_mm = np.sqrt(dx_mm**2 + dy_mm**2 + dz_mm**2)
-            max_centroid_shift_mm = float(np.max(displacements_mm))
-        else:
-            max_centroid_shift_mm = 999.0
-    else:
-        max_centroid_shift_mm = 0.0
-
     mean_valid_frac = float(np.mean(valid_fractions))
     mean_border_clip = float(np.mean(border_touch_fractions))
     head_clipped = head_clipped_count > (n_frames // 2)
     feet_clipped = feet_clipped_count > (n_frames // 2)
 
     reasons: List[str] = []
-    if max_centroid_shift_mm > th.motion_limit_mm:
+    if sway_mm > th.motion_limit_mm:
         reasons.append(
-            f"Subject motion {max_centroid_shift_mm:.1f} mm exceeds limit {th.motion_limit_mm:.1f} mm"
+            f"Subject sway {sway_mm:.1f} mm exceeds motion limit {th.motion_limit_mm:.1f} mm"
         )
     if mean_valid_frac < th.valid_depth_fraction:
         reasons.append(
@@ -259,7 +298,8 @@ def default_quality_fn(
     return {
         "is_flagged": is_flagged,
         "reasons": reasons,
-        "motion_mm": max_centroid_shift_mm,
+        "sway_mm": sway_mm,
+        "motion_mm": sway_mm,
         "temporal_depth_std_mm": median_depth_std_mm,
         "valid_depth_fraction": mean_valid_frac,
         "border_clip_fraction": mean_border_clip,
@@ -281,12 +321,18 @@ class CaptureController:
         thresholds: Optional[CaptureThresholds] = None,
         landmark_fn: Optional[Callable[[np.ndarray, np.ndarray], Optional[Dict[str, Any]]]] = None,
         quality_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+        bg_depth: Optional[np.ndarray] = None,
+        cfg: Optional[FullBodyConfig] = None,
+        turntable: bool = False,
     ):
         self.camera = camera
         self.writer = writer
         self.thresholds = thresholds or CaptureThresholds()
         self.landmark_fn = landmark_fn
         self.quality_fn = quality_fn or default_quality_fn
+        self.bg_depth = bg_depth
+        self.cfg = cfg or FullBodyConfig()
+        self.turntable = bool(turntable)
 
         self.state = ControllerState.WAIT_FOR_SUBJECT
         self.current_stop = 0
@@ -550,8 +596,13 @@ class CaptureController:
             depth_scale=self.camera.depth_scale,
             depth_units=self.camera.depth_units,
             thresholds=self.thresholds,
+            bg_depth=self.bg_depth,
+            cfg=self.cfg,
+            intrinsics=self.camera.intrinsics,
         )
         self._latest_eval_report = report
+        sway_val = float(report.get("sway_mm", report.get("motion_mm", 0.0)))
+        self._latest_motion_mm = sway_val
 
         # Optional landmarks
         if self.landmark_fn and len(self._burst_colors) > 0:
@@ -576,7 +627,7 @@ class CaptureController:
             if self._latest_eval_landmarks:
                 self.writer.write_landmarks(handle, self._latest_eval_landmarks)
 
-            self.writer.finish_attempt(handle, accepted=True, reason="Quality check passed")
+            self.writer.finish_attempt(handle, accepted=True, reason="Quality check passed", sway_mm=sway_val)
             self._transition(ControllerState.ACCEPT, now)
         else:
             handle = self.writer.begin_attempt(self.current_stop)
@@ -592,7 +643,7 @@ class CaptureController:
 
             fail_reasons = "; ".join(self._latest_eval_report.get("reasons", ["Quality check failed"]))
             self._latest_rejection_reason = fail_reasons
-            self.writer.finish_attempt(handle, accepted=False, reason=fail_reasons)
+            self.writer.finish_attempt(handle, accepted=False, reason=fail_reasons, sway_mm=sway_val)
             self._transition(ControllerState.RETAKE, now)
 
     def _step_accept(self, now: float) -> None:

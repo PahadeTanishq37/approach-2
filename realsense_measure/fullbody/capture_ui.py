@@ -47,11 +47,14 @@ def render_frame(
 
     # Generate colorized depth
     if depth_filtered is not None:
-        if depth_filtered.shape[:2] != (h, w):
-            depth_resized = cv2.resize(depth_filtered, (w, h), interpolation=cv2.INTER_NEAREST)
+        if depth_filtered.ndim == 3:
+            depth_vis = depth_filtered if depth_filtered.shape[:2] == (h, w) else cv2.resize(depth_filtered, (w, h))
         else:
-            depth_resized = depth_filtered
-        depth_vis = colorize_depth_m(depth_resized)
+            if depth_filtered.shape[:2] != (h, w):
+                depth_resized = cv2.resize(depth_filtered, (w, h), interpolation=cv2.INTER_NEAREST)
+            else:
+                depth_resized = depth_filtered
+            depth_vis = colorize_depth_m(depth_resized)
     else:
         depth_vis = np.zeros_like(color)
 
@@ -74,10 +77,15 @@ def render_frame(
     burst_prog = float(np.clip(state_snapshot.get("burst_progress", 0.0), 0.0, 1.0))
     rejection_reason = state_snapshot.get("last_rejection_reason")
 
-    # 1. Body-ROI guide rectangle on RGB feed (left side)
+    # 1. Body-ROI and Head/Feet frame guide on RGB feed (left side)
     guide_x0, guide_y0 = int(0.20 * w), int(0.05 * h)
     guide_x1, guide_y1 = int(0.80 * w), int(0.95 * h)
     cv2.rectangle(composite, (guide_x0, guide_y0), (guide_x1, guide_y1), (0, 255, 255), 1)
+    # Head and feet frame guide lines
+    cv2.line(composite, (10, guide_y0), (w - 10, guide_y0), (0, 255, 200), 1)
+    cv2.putText(composite, "HEAD GUIDE (5%)", (15, guide_y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200), 1)
+    cv2.line(composite, (10, guide_y1), (w - 10, guide_y1), (0, 255, 200), 1)
+    cv2.putText(composite, "FEET GUIDE (5%)", (15, guide_y1 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200), 1)
 
     # 2. Header banner with semi-transparent overlay
     banner_h = 80
@@ -110,16 +118,38 @@ def render_frame(
         stop_text += f" (Retake {retake_idx})"
     cv2.putText(composite, stop_text, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
 
-    # Turning instruction text (computed from turn_direction)
-    turn_deg = int(360 // max(1, n_stops))
-    if turn_dir == "cw":
-        instr_text = f"Turn {turn_deg} degrees to your RIGHT"
+    # Turning instruction text (computed from turn_direction, turntable, and target angle)
+    step_deg = 360.0 / max(1, n_stops)
+    target_angle = (stop_idx * step_deg) % 360.0
+    turntable = bool(state_snapshot.get("turntable", False))
+
+    if turntable:
+        instr_text = f"Turntable Target: {target_angle:.0f} deg (step {step_deg:.0f} deg)"
     else:
-        instr_text = f"Turn {turn_deg} degrees to your LEFT"
+        if turn_dir == "cw":
+            instr_text = f"Turn {step_deg:.0f} deg to RIGHT -> Target {target_angle:.0f} deg"
+        else:
+            instr_text = f"Turn {step_deg:.0f} deg to LEFT -> Target {target_angle:.0f} deg"
 
     (txt_w, txt_h), _ = cv2.getTextSize(instr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
     instr_x = max(w + 5, comp_w - txt_w - 15)
     cv2.putText(composite, instr_text, (instr_x, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+    # Per-stop on-screen prompt: "hold still" countdown (2.0s) or turn prompt (45 deg)
+    if state == "WAIT_STILL":
+        still_cur = int(state_snapshot.get("stillness_frames_current", 0))
+        still_tgt = int(state_snapshot.get("stillness_frames_target", 60))
+        rem_frames = max(0, still_tgt - still_cur)
+        rem_s = rem_frames / 30.0
+        countdown_text = f"HOLD STILL: {rem_s:.1f}s ({still_cur}/{still_tgt})"
+        (cd_w, cd_h), _ = cv2.getTextSize(countdown_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+        cd_x = max(20, (comp_w - cd_w) // 2)
+        cv2.putText(composite, countdown_text, (cd_x, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 165, 255), 2)
+    elif state == "TURN_PROMPT":
+        turn_prompt_text = f"TURN TO NEXT POSITION (+{step_deg:.0f}° -> Target {target_angle:.0f}°) [Press SPACE or wait]"
+        (tp_w, tp_h), _ = cv2.getTextSize(turn_prompt_text, cv2.FONT_HERSHEY_SIMPLEX, 0.70, 2)
+        tp_x = max(20, (comp_w - tp_w) // 2)
+        cv2.putText(composite, turn_prompt_text, (tp_x, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 255), 2)
 
     # Active orientation indicator (e.g. Orientation: PORTRAIT CCW or LANDSCAPE)
     orient = str(state_snapshot.get("orientation", "")).strip().lower()
@@ -141,9 +171,11 @@ def render_frame(
     hud_y = banner_h + 25
     x_off = 20
 
-    # Distance metric [1.10 - 1.50]
+    # Distance metric [capture_dist_min_m - capture_dist_max_m] (default [1.70 - 2.40])
+    d_min = float(state_snapshot.get("dist_min_m", 1.70))
+    d_max = float(state_snapshot.get("dist_max_m", 2.40))
     if dist_m is not None:
-        d_color = (0, 255, 0) if (1.10 <= dist_m <= 1.50) else (0, 0, 255)
+        d_color = (0, 255, 0) if (d_min <= dist_m <= d_max) else (0, 0, 255)
         d_str = f"Dist: {dist_m:.2f}m"
     else:
         d_color = (180, 180, 180)
@@ -239,7 +271,10 @@ def run_ui_loop(
                     "stop_index": getattr(controller, "current_stop", 0),
                     "n_stops": getattr(controller, "n_stops", 8),
                     "turn_direction": getattr(controller.writer, "turn_direction", "cw"),
-                    "orientation": getattr(controller, "portrait_rotation", getattr(getattr(controller, "writer", None), "camera_portrait_rotation", "ccw")),
+                    "turntable": getattr(controller, "turntable", False),
+                    "stillness_frames_current": len(getattr(controller, "_stillness_window", [])),
+                    "stillness_frames_target": getattr(controller.thresholds, "stillness_frames", 60),
+                    "orientation": getattr(controller, "portrait_rotation", getattr(getattr(controller, "writer", None), "camera_portrait_rotation", "none")),
                     "current_retake": getattr(controller, "current_retake", 0),
                     "distance_m": getattr(controller, "_latest_distance_m", None),
                     "valid_depth_pct": getattr(controller, "_latest_valid_depth_pct", None),
@@ -257,7 +292,14 @@ def run_ui_loop(
                     color = np.zeros((480, 270, 3), dtype=np.uint8)
 
                 frame = render_frame(snapshot, color, depth)
-                cv2.imshow(window_name, frame)
+                disp_frame = frame
+                if frame.shape[1] > 1920:
+                    disp_frame = cv2.resize(
+                        frame,
+                        (frame.shape[1] // 2, frame.shape[0] // 2),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                cv2.imshow(window_name, disp_frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == 32:  # SPACE

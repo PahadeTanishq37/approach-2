@@ -23,12 +23,15 @@ class FakeCamera:
 
     def __init__(
         self,
-        width: int = 480,
-        height: int = 848,
+        width: int = 1280,
+        height: int = 720,
         depth_scale: float = 0.001,
         depth_units: str = "sensor_units",
-        base_depth_m: float = 1.25,
+        base_depth_m: float = 2.00,
         fps: float = 30.0,
+        fx: Optional[float] = None,
+        fy: Optional[float] = None,
+        empty_scene: bool = False,
     ):
         self.width = width
         self.height = height
@@ -36,6 +39,9 @@ class FakeCamera:
         self._depth_units = str(depth_units)
         self.base_depth_m = float(base_depth_m)
         self.fps = float(fps)
+        self.fx = fx
+        self.fy = fy
+        self.empty_scene = bool(empty_scene)
 
         self.is_running = False
         self.frame_id = 0
@@ -49,14 +55,16 @@ class FakeCamera:
 
     @property
     def intrinsics(self) -> Dict[str, Any]:
+        fx = self.fx if self.fx is not None else (640.0 if self.width == 1280 else 425.0)
+        fy = self.fy if self.fy is not None else fx
         return {
             "width": self.width,
             "height": self.height,
-            "fx": 425.0,
-            "fy": 425.0,
+            "fx": fx,
+            "fy": fy,
             "cx": self.width / 2.0,
             "cy": self.height / 2.0,
-            "is_post_rotation": True,
+            "is_post_rotation": bool(self.width < self.height),
             "is_post_decimation": False,
         }
 
@@ -98,32 +106,41 @@ class FakeCamera:
 
         # Handle faults
         if self.fault == "too_far":
-            current_depth_m = 2.50
+            current_depth_m = 2.70
         elif self.fault == "too_close":
-            current_depth_m = 0.70
+            current_depth_m = 1.30
 
         if self.fault == "swaying":
             # Significant sway: +/- 40 pixels lateral shift oscillating at 1 Hz
             cx += 40.0 * math.sin(2.0 * math.pi * 1.0 * ts)
 
-        # Body ellipsoid: torso + head + limbs
-        # Torso center
-        torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - cy) / (h * 0.35)) ** 2) <= 1.0
+        is_empty = self.empty_scene or (self.fault == "empty_scene")
+        if is_empty:
+            # Empty background scene: wall at 3.0 m, floor plane at camera height 0.95 m
+            fy_val = self.fy if self.fy is not None else (640.0 if self.width == 1280 else 425.0)
+            depth_m = np.full((h, w), 3.00, dtype=np.float32)
+            # Floor plane in camera coordinates (optical frame: +Y down, normal [0, -1, 0], height 0.95m)
+            y_1d = np.arange(h, dtype=np.float32)
+            floor_rows = y_1d > (cy + 20)
+            floor_z_1d = (0.95 * fy_val) / np.maximum(y_1d - cy, 1e-3)
+            valid_floor_rows = floor_rows & (floor_z_1d >= 0.5) & (floor_z_1d <= 3.0)
+            for r in np.where(valid_floor_rows)[0]:
+                depth_m[r, :] = floor_z_1d[r]
+            body_mask = np.zeros((h, w), dtype=bool)
+        else:
+            # Body ellipsoid: torso + head + limbs
+            torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - cy) / (h * 0.35)) ** 2) <= 1.0
 
-        # Head center
-        head_cy = cy - h * 0.38
-        if self.fault == "head_clipped":
-            # Shift body and head up so head hits row 0
-            head_cy = 10.0
-            torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - (cy - h * 0.25)) / (h * 0.35)) ** 2) <= 1.0
+            head_cy = cy - h * 0.38
+            if self.fault == "head_clipped":
+                # Shift body and head up so head hits row 0
+                head_cy = 10.0
+                torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - (cy - h * 0.25)) / (h * 0.35)) ** 2) <= 1.0
 
-        head_mask = (((x_coords - cx) / (w * 0.12)) ** 2 + ((y_coords - head_cy) / (h * 0.10)) ** 2) <= 1.0
-
-        body_mask = torso_mask | head_mask
-
-        # Depth buffer in metres
-        depth_m = np.zeros((h, w), dtype=np.float32)
-        depth_m[body_mask] = current_depth_m
+            head_mask = (((x_coords - cx) / (w * 0.12)) ** 2 + ((y_coords - head_cy) / (h * 0.10)) ** 2) <= 1.0
+            body_mask = torso_mask | head_mask
+            depth_m = np.zeros((h, w), dtype=np.float32)
+            depth_m[body_mask] = current_depth_m
 
         if self.fault == "depth_dropout":
             # Severe dropout: zero out 85% of pixels

@@ -8,7 +8,9 @@ camera-to-world coordinate transform computation.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -136,7 +138,8 @@ def fit_floor_plane(
     inlier_ratio = float(len(inliers) / len(pts))
 
     # Compute gravity alignment rotation R_grav_cam: normal -> [0, 1, 0]
-    R_grav_cam = compute_rotation_aligning_vectors(normal, np.array([0.0, 1.0, 0.0]))
+    # preserving camera forward heading along +Z
+    R_grav_cam = build_gravity_rotation(normal)
 
     return FloorPlane(
         coefficients=np.array([normal[0], normal[1], normal[2], d], dtype=np.float64),
@@ -149,12 +152,56 @@ def fit_floor_plane(
     )
 
 
+def build_gravity_rotation(up_cam: np.ndarray) -> np.ndarray:
+    """
+    Build 3x3 rotation matrix R from camera optical coordinates to gravity frame:
+      Y_g = up_cam (unit vector pointing upwards)
+      Z_g = camera forward (0, 0, 1) minus its component along Y_g, normalized
+      X_g = cross(Y_g, Z_g), normalized
+      R = stack of rows [X_g, Y_g, Z_g]
+
+    Properties:
+      - det(R) = +1 (proper orthonormal rotation)
+      - R @ up_cam = [0, 1, 0] (+Y is upwards in gravity frame)
+      - R @ [0, 0, 1] has X=0 and Z>0 (camera forward maps to azimuth 0 along +Z)
+      - For level camera where up_cam = [0, -1, 0], R = diag(-1, -1, 1).
+    """
+    up = np.asarray(up_cam, dtype=np.float64).reshape(3)
+    norm_up = np.linalg.norm(up)
+    if norm_up < 1e-8:
+        raise ValueError("up_cam must be a non-zero vector")
+    Y_g = up / norm_up
+
+    fwd = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    Z_proj = fwd - np.dot(fwd, Y_g) * Y_g
+    norm_z = np.linalg.norm(Z_proj)
+    if norm_z < 1e-8:
+        # Singular case: camera pointing straight up or straight down
+        alt = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        Z_proj = alt - np.dot(alt, Y_g) * Y_g
+        norm_z = np.linalg.norm(Z_proj)
+    Z_g = Z_proj / norm_z
+
+    X_g = np.cross(Y_g, Z_g)
+    norm_x = np.linalg.norm(X_g)
+    if norm_x < 1e-8:
+        X_g = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        X_g /= norm_x
+
+    R = np.vstack([X_g, Y_g, Z_g])
+    return R
+
+
 def compute_rotation_aligning_vectors(
     src_vec: np.ndarray,
     dst_vec: np.ndarray,
 ) -> np.ndarray:
     """
     Compute minimal 3x3 rotation matrix R such that R @ src_vec = dst_vec.
+    NOTE: When src_vec and dst_vec are nearly antipodal (dot ~ -1),
+    the rotation axis is unconstrained in the orthogonal plane.
+    For gravity frames, use build_gravity_rotation(up_cam) instead.
     """
     v1 = src_vec / np.linalg.norm(src_vec)
     v2 = dst_vec / np.linalg.norm(dst_vec)
@@ -226,7 +273,7 @@ def verify_floor_consistency(
     # Use median distance and mean normal for robust consensus plane
     mean_d = float(np.median([p.coefficients[3] for p in planes]))
     consensus_point = -mean_d * mean_normal
-    R_grav_cam = compute_rotation_aligning_vectors(mean_normal, np.array([0.0, 1.0, 0.0]))
+    R_grav_cam = build_gravity_rotation(mean_normal)
 
     consensus_plane = FloorPlane(
         coefficients=np.array([mean_normal[0], mean_normal[1], mean_normal[2], mean_d]),
@@ -238,4 +285,48 @@ def verify_floor_consistency(
         gravity_R_cam=R_grav_cam,
     )
     return is_consistent, consensus_plane
+
+
+def save_floor_plane(floor: FloorPlane, path: Path) -> None:
+    """Save FloorPlane attributes to a JSON file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "coefficients": floor.coefficients.tolist(),
+        "normal": floor.normal.tolist(),
+        "point_on_plane": floor.point_on_plane.tolist(),
+        "inlier_count": int(floor.inlier_count),
+        "inlier_ratio": float(floor.inlier_ratio),
+        "rmse_m": float(floor.rmse_m),
+        "gravity_R_cam": floor.gravity_R_cam.tolist(),
+        "is_observed": bool(floor.is_observed),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_floor_plane(path: Path) -> Optional[FloorPlane]:
+    """Load FloorPlane from a JSON file."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        normal = np.array(data["normal"], dtype=np.float64)
+        # Recompute gravity_R_cam via build_gravity_rotation to ensure consistent forward heading
+        gravity_R = build_gravity_rotation(normal)
+        return FloorPlane(
+            coefficients=np.array(data["coefficients"], dtype=np.float64),
+            normal=normal,
+            point_on_plane=np.array(data["point_on_plane"], dtype=np.float64),
+            inlier_count=int(data.get("inlier_count", 0)),
+            inlier_ratio=float(data.get("inlier_ratio", 0.0)),
+            rmse_m=float(data.get("rmse_m", 0.0)),
+            gravity_R_cam=gravity_R,
+            is_observed=bool(data.get("is_observed", True)),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to load floor plane from {path}: {exc}")
+        return None
 
