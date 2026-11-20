@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bg = subparsers.add_parser("capture-background", help="Capture empty-scene background burst and calibrate single floor plane.")
     p_bg.add_argument("--out", type=str, default="raw_captures/background", help="Persistent destination directory for background assets (default: raw_captures/background).")
     p_bg.add_argument("--portrait", "--rotation", dest="portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Camera rotation (default: 'none').")
+    p_bg.add_argument("--resolution", type=str, choices=["1280x720", "848x480"], default="1280x720", help="Camera stream resolution: '1280x720' (default) or '848x480'.")
     p_bg.add_argument("--burst-frames", type=int, default=30, help="Number of frames in background burst (default: 30).")
     p_bg.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera for headless testing.")
 
@@ -158,6 +159,8 @@ def _run_capture(args: argparse.Namespace) -> int:
             w_c, h_c = [int(v) for v in res_str.lower().split("x")]
         else:
             w_c, h_c = 1280, 720
+        if getattr(args, "portrait", "none") in ("cw", "ccw"):
+            w_c, h_c = h_c, w_c
         cam = FakeCamera(
             width=w_c,
             height=h_c,
@@ -238,14 +241,106 @@ def _run_capture(args: argparse.Namespace) -> int:
     controller: Optional[CaptureController] = None
 
     try:
-        # Load background depth map for foreground segmentation if available
-        bg_depth = None
+        # Load background depth map for foreground segmentation
         bg_dir = Path(getattr(args, "background", "raw_captures/background"))
-        if bg_dir.exists() and (bg_dir / "background_depth.npy").exists():
+        stream_w = int(cam.intrinsics.get("width", 1280))
+        stream_h = int(cam.intrinsics.get("height", 720))
+
+        if not bg_dir.exists() or not (bg_dir / "background_depth.npy").exists():
+            print(
+                f"Capture error: No background depth map found at {bg_dir}. Run capture-background at {stream_w}x{stream_h} first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            bg_depth = np.load(str(bg_dir / "background_depth.npy")).astype(np.float32)
+        except Exception as e:
+            print(f"Capture error: Failed to load background depth: {e}", file=sys.stderr)
+            return 1
+
+        if bg_depth.shape[:2] != (stream_h, stream_w):
+            print(
+                f"Capture error: Background resolution {bg_depth.shape[1]}x{bg_depth.shape[0]} "
+                f"does not match camera stream {stream_w}x{stream_h}. Run capture-background at {stream_w}x{stream_h} first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Check background_meta.json
+        meta_file = bg_dir / "background_meta.json"
+        bg_meta: Dict[str, Any] = {}
+        if meta_file.exists():
             try:
-                bg_depth = np.load(str(bg_dir / "background_depth.npy")).astype(np.float32)
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    bg_meta = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load background depth: {e}")
+                logger.warning(f"Could not read {meta_file}: {e}")
+
+        bg_w = bg_meta.get("width")
+        bg_h = bg_meta.get("height")
+        if bg_w is not None and bg_h is not None:
+            if (int(bg_w), int(bg_h)) != (stream_w, stream_h):
+                print(
+                    f"Capture error: Background resolution {bg_w}x{bg_h} does not match camera stream {stream_w}x{stream_h}. "
+                    f"Run capture-background at {stream_w}x{stream_h} first.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        bg_intr = bg_meta.get("intrinsics")
+        if bg_intr and isinstance(bg_intr, dict):
+            for k in ("fx", "fy", "cx", "cy"):
+                if k in bg_intr and k in cam.intrinsics:
+                    diff_val = abs(float(bg_intr[k]) - float(cam.intrinsics[k]))
+                    if diff_val > 5.0:
+                        print(
+                            f"Capture error: Background intrinsic {k}={bg_intr[k]} does not match camera stream {cam.intrinsics[k]} "
+                            f"(diff={diff_val:.1f}px). Run capture-background at {stream_w}x{stream_h} first.",
+                            file=sys.stderr,
+                        )
+                        return 1
+
+        # Compare floor-plane normal and camera height to background's and warn
+        bg_normal = bg_meta.get("floor_normal")
+        bg_cam_h = bg_meta.get("camera_height_m")
+        if bg_normal is not None and bg_cam_h is not None:
+            sample_c, sample_r, sample_f, _ = cam.read_raw_filtered()
+            if sample_r is not None:
+                try:
+                    import open3d as o3d
+                    from realsense_measure.fullbody.config import FullBodyConfig
+                    from realsense_measure.fullbody.floor import fit_floor_plane
+
+                    o3d_i = o3d.camera.PinholeCameraIntrinsic(
+                        stream_w,
+                        stream_h,
+                        float(cam.intrinsics["fx"]),
+                        float(cam.intrinsics["fy"]),
+                        float(cam.intrinsics["cx"]),
+                        float(cam.intrinsics["cy"]),
+                    )
+                    scale = cam.depth_scale if cam.depth_units == "sensor_units" else 1.0
+                    d_m_sample = sample_r.astype(np.float32) * scale
+                    cur_floor = fit_floor_plane(d_m_sample, o3d_i, FullBodyConfig())
+                    if cur_floor is not None:
+                        cur_n = cur_floor.normal
+                        bg_n = np.array(bg_normal, dtype=np.float32)
+                        cur_n_norm = cur_n / max(1e-6, np.linalg.norm(cur_n))
+                        bg_n_norm = bg_n / max(1e-6, np.linalg.norm(bg_n))
+                        cos_ang = np.clip(abs(np.dot(cur_n_norm, bg_n_norm)), -1.0, 1.0)
+                        ang_diff_deg = float(np.rad2deg(np.arccos(cos_ang)))
+                        cur_cam_h = abs(float(cur_floor.coefficients[3]))
+                        h_diff_m = abs(cur_cam_h - float(bg_cam_h))
+                        if ang_diff_deg > 1.0 or h_diff_m > 0.03:
+                            warn_msg = (
+                                f"camera moved since background: normal differs by {ang_diff_deg:.2f} deg (>1.0 deg), "
+                                f"height differs by {h_diff_m * 100:.1f} cm (>3.0 cm)"
+                            )
+                            print(f"\nWARNING: {warn_msg}")
+                            logger.warning(warn_msg)
+                except Exception as floor_exc:
+                    logger.debug(f"Floor drift check skipped: {floor_exc}")
 
         writer = SessionWriter(
             root=out_dir,
@@ -324,12 +419,27 @@ def _run_capture(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
+    # Print session summary with accepted stops and per-stop file counts
+    print("\n" + "=" * 60)
+    print("CAPTURE SESSION SUMMARY")
+    print("=" * 60)
+    print(f"Session Directory:  {out_dir}")
+    print(f"Accepted Stops:     {accepted_stops} of {args.stops}")
+    for s_idx in range(args.stops):
+        s_folder = out_dir / f"stop_{s_idx:02d}"
+        if s_folder.exists():
+            n_files = len(list(s_folder.glob("*")))
+            print(f"  - stop_{s_idx:02d}: {n_files} files")
+        else:
+            print(f"  - stop_{s_idx:02d}: not created")
+    print("=" * 60 + "\n")
+
     if controller is not None and controller.state == ControllerState.DONE:
-        print(f"\nCapture session successfully finalized at: {out_dir}")
+        print(f"Capture session successfully finalized at: {out_dir}")
         print(f"Accepted all {args.stops} stops.")
         return 0
     else:
-        print(f"\nSession unfinalized at {out_dir}. Accepted stops: {accepted_stops} of {args.stops}.")
+        print(f"Session unfinalized at {out_dir}. Accepted stops: {accepted_stops} of {args.stops}.")
         print("Raw attempt data and integrity hashes remain intact on disk.")
         return 1
 
@@ -672,11 +782,18 @@ def _run_capture_background(args: argparse.Namespace) -> int:
     cfg = FullBodyConfig()
 
     portrait = getattr(args, "portrait", "none")
+    res_str = getattr(args, "resolution", "1280x720")
     if getattr(args, "fake", False):
         from tests.fullbody.fake_camera import FakeCamera
+        if "x" in res_str:
+            w_c, h_c = [int(v) for v in res_str.lower().split("x")]
+        else:
+            w_c, h_c = 1280, 720
+        if portrait in ("cw", "ccw"):
+            w_c, h_c = h_c, w_c
         cam = FakeCamera(
-            width=848 if portrait == "none" else 480,
-            height=480 if portrait == "none" else 848,
+            width=w_c,
+            height=h_c,
             depth_scale=0.001,
             depth_units="sensor_units",
             fps=30.0,
@@ -684,7 +801,7 @@ def _run_capture_background(args: argparse.Namespace) -> int:
         )
     else:
         from realsense_measure.fullbody.capture_camera import RealSenseCaptureAdapter, full_body_camera_config
-        cam_cfg = full_body_camera_config(portrait_rotation=portrait)
+        cam_cfg = full_body_camera_config(portrait_rotation=portrait, resolution=res_str)
         cam = RealSenseCaptureAdapter(camera_config=cam_cfg, portrait_rotation=portrait)
 
     try:
@@ -764,14 +881,17 @@ def _run_capture_background(args: argparse.Namespace) -> int:
 
     cam_h_m = float(abs(floor.coefficients[3])) if floor is not None else None
     meta = {
-        "device_info": cam.device_info(),
+        "width": int(intr["width"]),
+        "height": int(intr["height"]),
         "intrinsics": intr,
+        "device_info": cam.device_info(),
         "burst_frames_requested": burst_frames,
         "burst_frames_captured": len(raw_depths),
         "portrait_rotation": portrait,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "floor_detected": floor is not None,
         "camera_height_m": cam_h_m,
+        "floor_normal": floor.normal.tolist() if floor is not None else None,
         "imu_gravity": imu_gravity.tolist() if imu_gravity is not None else None,
         "imu_floor_angle_deg": imu_angle_deg,
     }

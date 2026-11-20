@@ -219,6 +219,16 @@ def test_cli_import_isolation():
 def test_cli_capture_fake_end_to_end():
     """Verify python -m realsense_measure.fullbody capture --fake end-to-end creates finalized session."""
     with tempfile.TemporaryDirectory() as tmpdir:
+        bg_dir = Path(tmpdir) / "bg_calib"
+        bg_argv = [
+            "capture-background",
+            "--out", str(bg_dir),
+            "--portrait", "cw",
+            "--burst-frames", "2",
+            "--fake",
+        ]
+        assert main(bg_argv) == 0
+
         out_dir = Path(tmpdir) / "fake_capture"
         argv = [
             "capture",
@@ -229,6 +239,9 @@ def test_cli_capture_fake_end_to_end():
             "--portrait", "cw",
             "--fake",
             "--burst-frames", "3",
+            "--background", str(bg_dir),
+            "--turn-prompt-timeout", "0.1",
+            "--hold-still-s", "0.1",
             "--headless",
         ]
         ret = main(argv)
@@ -361,6 +374,16 @@ def test_render_frame_turntable_and_countdown():
 def test_intrinsics_mismatch_fails_on_load():
     """Verify load_capture_session fails if intrinsics differ from expected profile by >0.5 px."""
     with tempfile.TemporaryDirectory() as tmpdir:
+        bg_dir = Path(tmpdir) / "bg_calib"
+        bg_argv = [
+            "capture-background",
+            "--out", str(bg_dir),
+            "--burst-frames", "2",
+            "--resolution", "848x480",
+            "--fake",
+        ]
+        assert main(bg_argv) == 0
+
         out_dir = Path(tmpdir) / "intr_session"
         argv = [
             "capture",
@@ -369,6 +392,9 @@ def test_intrinsics_mismatch_fails_on_load():
             "--stops", "8",
             "--fake",
             "--burst-frames", "2",
+            "--background", str(bg_dir),
+            "--turn-prompt-timeout", "0.1",
+            "--hold-still-s", "0.1",
             "--headless",
             "--resolution", "848x480",
         ]
@@ -407,6 +433,8 @@ def test_background_sha256_verification_on_load():
             "--fake",
             "--burst-frames", "2",
             "--background", str(bg_dir),
+            "--turn-prompt-timeout", "0.1",
+            "--hold-still-s", "0.1",
             "--headless",
         ]
         assert main(argv) == 0

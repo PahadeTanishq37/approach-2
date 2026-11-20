@@ -74,18 +74,33 @@ def render_frame(
     motion_mm = state_snapshot.get("motion_mm")
     head_ok = bool(state_snapshot.get("head_visible", True))
     feet_ok = bool(state_snapshot.get("feet_visible", True))
+    head_margin_pct = state_snapshot.get("head_margin_pct")
+    sole_margin_pct = state_snapshot.get("sole_margin_pct")
+    clip_pct = state_snapshot.get("clip_pct")
     burst_prog = float(np.clip(state_snapshot.get("burst_progress", 0.0), 0.0, 1.0))
     rejection_reason = state_snapshot.get("last_rejection_reason")
 
-    # 1. Body-ROI and Head/Feet frame guide on RGB feed (left side)
-    guide_x0, guide_y0 = int(0.20 * w), int(0.05 * h)
-    guide_x1, guide_y1 = int(0.80 * w), int(0.95 * h)
-    cv2.rectangle(composite, (guide_x0, guide_y0), (guide_x1, guide_y1), (0, 255, 255), 1)
-    # Head and feet frame guide lines
-    cv2.line(composite, (10, guide_y0), (w - 10, guide_y0), (0, 255, 200), 1)
-    cv2.putText(composite, "HEAD GUIDE (5%)", (15, guide_y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200), 1)
-    cv2.line(composite, (10, guide_y1), (w - 10, guide_y1), (0, 255, 200), 1)
-    cv2.putText(composite, "FEET GUIDE (5%)", (15, guide_y1 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200), 1)
+    # 1. Foreground outline and Bounding Box on RGB feed (left side)
+    fg_m = state_snapshot.get("fg_mask")
+    if fg_m is not None and isinstance(fg_m, np.ndarray):
+        fg_u8 = (fg_m > 0).astype(np.uint8)
+        if fg_u8.shape[:2] != (h, w):
+            fg_u8 = cv2.resize(fg_u8, (w, h), interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours(fg_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(composite[:, :w], contours, -1, (0, 255, 0), 2)
+
+    bbox = state_snapshot.get("bbox")
+    if bbox is not None and len(bbox) == 4:
+        bx0, by0, bx1, by1 = bbox
+        cv2.rectangle(composite[:, :w], (bx0, by0), (bx1, by1), (0, 255, 255), 2)
+
+    # 4% Head and Feet margin guidelines on RGB feed (left side)
+    y_head_4 = int(0.04 * h)
+    y_sole_4 = int(0.96 * h)
+    cv2.line(composite[:, :w], (0, y_head_4), (w, y_head_4), (0, 165, 255), 1)
+    cv2.putText(composite[:, :w], "HEAD MARGIN (4%)", (15, max(12, y_head_4 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1)
+    cv2.line(composite[:, :w], (0, y_sole_4), (w, y_sole_4), (0, 165, 255), 1)
+    cv2.putText(composite[:, :w], "SOLE MARGIN (4%)", (15, min(h - 5, y_sole_4 + 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1)
 
     # 2. Header banner with semi-transparent overlay
     banner_h = 80
@@ -180,18 +195,38 @@ def render_frame(
     else:
         d_color = (180, 180, 180)
         d_str = "Dist: --"
-    cv2.putText(composite, d_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, d_color, 2)
+    cv2.putText(composite, d_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, d_color, 2)
+    x_off += 140
+
+    # Head Margin % (>= 4.0%)
+    if head_margin_pct is not None:
+        hm_color = (0, 255, 0) if head_margin_pct >= 4.0 else (0, 0, 255)
+        hm_str = f"Head: {head_margin_pct:.1f}%"
+    else:
+        hm_color = (180, 180, 180)
+        hm_str = f"Head: {'OK' if head_ok else 'CLIP'}"
+    cv2.putText(composite, hm_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, hm_color, 2)
     x_off += 150
 
-    # Valid depth % (>= 30%)
-    if valid_pct is not None:
-        v_color = (0, 255, 0) if valid_pct >= 30.0 else (0, 0, 255)
-        v_str = f"Depth: {valid_pct:.1f}%"
+    # Sole Margin % (>= 4.0%)
+    if sole_margin_pct is not None:
+        sm_color = (0, 255, 0) if sole_margin_pct >= 4.0 else (0, 0, 255)
+        sm_str = f"Sole: {sole_margin_pct:.1f}%"
     else:
-        v_color = (180, 180, 180)
-        v_str = "Depth: --"
-    cv2.putText(composite, v_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, v_color, 2)
-    x_off += 160
+        sm_color = (180, 180, 180)
+        sm_str = f"Sole: {'OK' if feet_ok else 'CLIP'}"
+    cv2.putText(composite, sm_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, sm_color, 2)
+    x_off += 150
+
+    # Side Clip %
+    if clip_pct is not None:
+        cl_color = (0, 255, 0) if clip_pct <= 0.0 else (0, 0, 255)
+        cl_str = f"Clip: {clip_pct:.1f}%"
+    else:
+        cl_color = (180, 180, 180)
+        cl_str = "Clip: --"
+    cv2.putText(composite, cl_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, cl_color, 2)
+    x_off += 140
 
     # Motion mm (<= 10.0 mm)
     if motion_mm is not None:
@@ -200,13 +235,7 @@ def render_frame(
     else:
         m_color = (180, 180, 180)
         m_str = "Motion: --"
-    cv2.putText(composite, m_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, m_color, 2)
-    x_off += 180
-
-    # Head and feet visibility
-    hf_color = (0, 255, 0) if (head_ok and feet_ok) else (0, 0, 255)
-    hf_str = f"Head: {'OK' if head_ok else 'CLIP'} | Feet: {'OK' if feet_ok else 'CLIP'}"
-    cv2.putText(composite, hf_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hf_color, 2)
+    cv2.putText(composite, m_str, (x_off, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, m_color, 2)
 
     # 4. Last rejection reason
     if rejection_reason:
@@ -215,7 +244,7 @@ def render_frame(
             f"REJECTED: {rejection_reason}",
             (20, h - 55),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (0, 0, 255),
             2,
         )
@@ -252,6 +281,7 @@ def run_ui_loop(
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
     step_count = 0
+    last_console_log_t = 0.0
     try:
         while True:
             now = time.time()
@@ -263,6 +293,26 @@ def run_ui_loop(
 
             if max_steps is not None and step_count >= max_steps:
                 break
+
+            # 2-second periodic console log
+            if (now - last_console_log_t) >= 2.0:
+                last_console_log_t = now
+                st_name = controller.state.value if hasattr(controller.state, "value") else str(controller.state)
+                d_val = getattr(controller, "_latest_distance_m", None)
+                d_str = f"{d_val:.2f}m" if d_val is not None else "--"
+                hm_val = getattr(controller, "_latest_head_margin_pct", None)
+                hm_str = f"{hm_val:.1f}%" if hm_val is not None else "--"
+                sm_val = getattr(controller, "_latest_sole_margin_pct", None)
+                sm_str = f"{sm_val:.1f}%" if sm_val is not None else "--"
+                cl_val = getattr(controller, "_latest_clip_pct", None)
+                cl_str = f"{cl_val:.1f}%" if cl_val is not None else "--"
+                bbox_val = getattr(controller, "_latest_bbox", None)
+                bbox_str = str(bbox_val) if bbox_val is not None else "--"
+                reason_str = getattr(controller, "_latest_rejection_reason", None) or "None"
+                print(
+                    f"[{st_name:<16}] Dist: {d_str} | Head: {hm_str} | Sole: {sm_str} | "
+                    f"Clip: {cl_str} | BBox: {bbox_str} | Reason: {reason_str}"
+                )
 
             if not headless:
                 # Build snapshot from controller
@@ -281,6 +331,11 @@ def run_ui_loop(
                     "motion_mm": getattr(controller, "_latest_motion_mm", None),
                     "head_visible": getattr(controller, "_latest_head_visible", True),
                     "feet_visible": getattr(controller, "_latest_feet_visible", True),
+                    "head_margin_pct": getattr(controller, "_latest_head_margin_pct", None),
+                    "sole_margin_pct": getattr(controller, "_latest_sole_margin_pct", None),
+                    "clip_pct": getattr(controller, "_latest_clip_pct", None),
+                    "fg_mask": getattr(controller, "_latest_fg_mask", None),
+                    "bbox": getattr(controller, "_latest_bbox", None),
                     "burst_progress": len(getattr(controller, "_burst_depths", [])) / max(1, controller.thresholds.burst_frames),
                     "last_rejection_reason": getattr(controller, "_latest_rejection_reason", None),
                 }

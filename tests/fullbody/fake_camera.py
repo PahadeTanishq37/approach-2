@@ -55,7 +55,7 @@ class FakeCamera:
 
     @property
     def intrinsics(self) -> Dict[str, Any]:
-        fx = self.fx if self.fx is not None else (640.0 if self.width == 1280 else 425.0)
+        fx = self.fx if self.fx is not None else (640.0 if (self.width >= 1280 or self.height >= 1280) else 425.0)
         fy = self.fy if self.fy is not None else fx
         return {
             "width": self.width,
@@ -117,7 +117,7 @@ class FakeCamera:
         is_empty = self.empty_scene or (self.fault == "empty_scene")
         if is_empty:
             # Empty background scene: wall at 3.0 m, floor plane at camera height 0.95 m
-            fy_val = self.fy if self.fy is not None else (640.0 if self.width == 1280 else 425.0)
+            fy_val = self.fy if self.fy is not None else (640.0 if (self.width >= 1280 or self.height >= 1280) else 425.0)
             depth_m = np.full((h, w), 3.00, dtype=np.float32)
             # Floor plane in camera coordinates (optical frame: +Y down, normal [0, -1, 0], height 0.95m)
             y_1d = np.arange(h, dtype=np.float32)
@@ -131,13 +131,22 @@ class FakeCamera:
             # Body ellipsoid: torso + head + limbs
             torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - cy) / (h * 0.35)) ** 2) <= 1.0
 
-            head_cy = cy - h * 0.38
+            head_cy = cy - h * 0.34
             if self.fault == "head_clipped":
                 # Shift body and head up so head hits row 0
-                head_cy = 10.0
+                head_cy = 5.0
                 torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - (cy - h * 0.25)) / (h * 0.35)) ** 2) <= 1.0
+            elif self.fault in ("sole_clipped", "feet_clipped"):
+                # Shift torso down so feet hit bottom border
+                torso_cy = cy + h * 0.16
+                torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - torso_cy) / (h * 0.35)) ** 2) <= 1.0
+                head_cy = torso_cy - h * 0.34
+            elif self.fault == "side_clipped":
+                # Shift body to right border
+                cx = w - 10.0
+                torso_mask = (((x_coords - cx) / (w * 0.22)) ** 2 + ((y_coords - cy) / (h * 0.35)) ** 2) <= 1.0
 
-            head_mask = (((x_coords - cx) / (w * 0.12)) ** 2 + ((y_coords - head_cy) / (h * 0.10)) ** 2) <= 1.0
+            head_mask = (((x_coords - cx) / (w * 0.12)) ** 2 + ((y_coords - head_cy) / (h * 0.09)) ** 2) <= 1.0
             body_mask = torso_mask | head_mask
             depth_m = np.zeros((h, w), dtype=np.float32)
             depth_m[body_mask] = current_depth_m

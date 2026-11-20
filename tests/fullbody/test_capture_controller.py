@@ -61,7 +61,8 @@ def test_clean_8_stop_run_reaches_done_and_loads():
             burst_timeout_s=1.0,
         )
 
-        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds)
+        bg_depth = np.full((cam.height, cam.width), 3.0, dtype=np.float32)
+        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds, bg_depth=bg_depth)
 
         now = 0.0
         max_steps = 2000
@@ -108,7 +109,8 @@ def test_swaying_subject_rejected_then_accepted():
             turn_prompt_timeout_s=0.1,
         )
 
-        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds)
+        bg_depth = np.full((cam.height, cam.width), 3.0, dtype=np.float32)
+        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds, bg_depth=bg_depth)
 
         # Trigger sway during first burst
         sway_injected = False
@@ -175,7 +177,8 @@ def test_head_clipped_rejected_with_reason_mentioning_head():
             position_check_timeout_s=0.2,
         )
 
-        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds)
+        bg_depth = np.full((cam.height, cam.width), 3.0, dtype=np.float32)
+        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds, bg_depth=bg_depth)
 
         # 1. In position check, it stays blocked and does not proceed to burst
         now = 0.0
@@ -192,7 +195,7 @@ def test_head_clipped_rejected_with_reason_mentioning_head():
         for d in burst_d:
             d[0:5, :] = 1.25
 
-        q_report = controller.quality_fn(burst_c, burst_d, 1.0, "m", thresholds)
+        q_report = controller.quality_fn(burst_c, burst_d, 1.0, "m", thresholds, bg_depth=bg_depth)
         assert q_report["is_flagged"] is True
         assert any("head" in r.lower() for r in q_report["reasons"])
 
@@ -222,7 +225,8 @@ def test_subject_too_far_rejected_before_burst_begins():
             position_check_timeout_s=0.2,
         )
 
-        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds)
+        bg_depth = np.full((cam.height, cam.width), 3.0, dtype=np.float32)
+        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds, bg_depth=bg_depth)
 
         now = 0.0
         for _ in range(50):
@@ -259,7 +263,8 @@ def test_max_retakes_exceeded_aborts_and_not_finalized():
             turn_prompt_timeout_s=0.05,
         )
 
-        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds)
+        bg_depth = np.full((cam.height, cam.width), 3.0, dtype=np.float32)
+        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds, bg_depth=bg_depth)
 
         now = 0.0
         for _ in range(500):
@@ -338,7 +343,8 @@ def test_controller_never_calls_sleep_or_input(monkeypatch):
             turn_prompt_timeout_s=0.05,
         )
 
-        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds)
+        bg_depth = np.full((cam.height, cam.width), 3.0, dtype=np.float32)
+        controller = CaptureController(camera=cam, writer=writer, thresholds=thresholds, bg_depth=bg_depth)
 
         now = 0.0
         for _ in range(100):
