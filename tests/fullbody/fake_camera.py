@@ -34,6 +34,9 @@ class FakeCamera:
         cx: Optional[float] = None,
         cy: Optional[float] = None,
         empty_scene: bool = False,
+        floor: bool = False,
+        floor_tilt_deg: float = 0.0,
+        floor_height_m: float = 0.95,
     ):
         self.width = width
         self.height = height
@@ -46,6 +49,9 @@ class FakeCamera:
         self.cx = cx
         self.cy = cy
         self.empty_scene = bool(empty_scene)
+        self.floor = bool(floor)
+        self.floor_tilt_deg = float(floor_tilt_deg)
+        self.floor_height_m = float(floor_height_m)
 
         self.is_running = False
         self.frame_id = 0
@@ -121,17 +127,30 @@ class FakeCamera:
             cx += 40.0 * math.sin(2.0 * math.pi * 1.0 * ts)
 
         is_empty = self.empty_scene or (self.fault == "empty_scene")
-        if is_empty:
-            # Empty background scene: wall at 3.0 m, floor plane at camera height 0.95 m
-            fy_val = self.fy if self.fy is not None else (640.0 if (self.width >= 1280 or self.height >= 1280) else 425.0)
-            depth_m = np.full((h, w), 3.00, dtype=np.float32)
-            # Floor plane in camera coordinates (optical frame: +Y down, normal [0, -1, 0], height 0.95m)
+        fy_val = self.fy if self.fy is not None else (640.0 if (self.width >= 1280 or self.height >= 1280) else 425.0)
+
+        # Floor plane generation
+        has_floor = self.floor or is_empty
+        floor_mask = np.zeros((h, w), dtype=bool)
+        floor_depth = np.zeros((h, w), dtype=np.float32)
+
+        if has_floor:
+            theta_rad = math.radians(self.floor_tilt_deg)
+            cos_t = math.cos(theta_rad)
+            sin_t = math.sin(theta_rad)
             y_1d = np.arange(h, dtype=np.float32)
-            floor_rows = y_1d > (cy + 20)
-            floor_z_1d = (0.95 * fy_val) / np.maximum(y_1d - cy, 1e-3)
-            valid_floor_rows = floor_rows & (floor_z_1d >= 0.5) & (floor_z_1d <= 3.0)
-            for r in np.where(valid_floor_rows)[0]:
-                depth_m[r, :] = floor_z_1d[r]
+            denom = cos_t * (y_1d - cy) / fy_val + sin_t
+            valid_rows = denom > 1e-4
+            z_1d = np.zeros(h, dtype=np.float32)
+            z_1d[valid_rows] = self.floor_height_m / denom[valid_rows]
+            valid_z_rows = valid_rows & (z_1d >= 0.5) & (z_1d <= 3.8)
+            for r in np.where(valid_z_rows)[0]:
+                floor_mask[r, :] = True
+                floor_depth[r, :] = z_1d[r]
+
+        if is_empty:
+            depth_m = np.full((h, w), 3.00, dtype=np.float32)
+            depth_m[floor_mask] = floor_depth[floor_mask]
             body_mask = np.zeros((h, w), dtype=bool)
         else:
             # Body ellipsoid: torso + head + limbs
@@ -155,6 +174,8 @@ class FakeCamera:
             head_mask = (((x_coords - cx) / (w * 0.12)) ** 2 + ((y_coords - head_cy) / (h * 0.09)) ** 2) <= 1.0
             body_mask = torso_mask | head_mask
             depth_m = np.zeros((h, w), dtype=np.float32)
+            if has_floor:
+                depth_m[floor_mask] = floor_depth[floor_mask]
             depth_m[body_mask] = current_depth_m
 
         if self.fault == "depth_dropout":
@@ -170,6 +191,8 @@ class FakeCamera:
 
         # Color buffer
         color_bgr = np.full((h, w, 3), 40, dtype=np.uint8)
+        if has_floor:
+            color_bgr[floor_mask] = [70, 70, 70]
         color_bgr[body_mask] = [180, 150, 120]
 
         filtered_depth_m = depth_m.copy()

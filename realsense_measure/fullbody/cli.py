@@ -149,6 +149,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_vses.add_argument("--capture", type=str, required=True, help="Path to raw capture session directory.")
 
+    # 12. scan-rigid
+    p_srigid = subparsers.add_parser(
+        "scan-rigid",
+        help="Run Layer 1 nominal-angle rigid baseline alignment and TSDF fusion.",
+    )
+    p_srigid.add_argument("--capture", type=str, required=True, help="Path to raw capture session directory.")
+    p_srigid.add_argument("--out", type=str, required=True, help="Destination directory for reconstructed assets.")
+    p_srigid.add_argument("--voxel", type=float, default=0.004, help="TSDF voxel length in metres (default: 0.004).")
+    p_srigid.add_argument("--refine", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable bounded 3-DOF refinement (default: ON for objects, OFF for persons).")
+    p_srigid.add_argument("--background", type=str, default=None, help="Optional background calibration directory.")
+
+    # 13. calib-object
+    p_calib = subparsers.add_parser(
+        "calib-object",
+        help="Analyze rigid cylinder/bucket diameter across 20 horizontal slices.",
+    )
+    p_calib.add_argument("--scan", type=str, required=True, help="Directory containing fused_mesh.ply or path to PLY file.")
+    p_calib.add_argument("--tape-mm", type=float, default=None, help="Known ground-truth tape diameter in mm.")
+
     return parser
 
 
@@ -1242,6 +1261,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.subcommand == "verify-session":
         from realsense_measure.fullbody.verify_session import verify_session
         return verify_session(Path(args.capture))
+
+    elif args.subcommand == "scan-rigid":
+        from realsense_measure.fullbody.rigid_baseline import run_rigid_baseline
+        bg_d = Path(args.background) if getattr(args, "background", None) else None
+        rep = run_rigid_baseline(
+            capture_dir=Path(args.capture),
+            out_dir=Path(args.out),
+            bg_dir=bg_d,
+            voxel_size_m=float(args.voxel),
+            refine=args.refine,
+        )
+        print(f"\nRigid baseline reconstruction completed. Output saved to: {args.out}")
+        return 0
+
+    elif args.subcommand == "calib-object":
+        from tools.calib_object import analyze_cylinder_diameter, print_calib_summary
+        rep = analyze_cylinder_diameter(
+            scan_path=Path(args.scan),
+            tape_diameter_mm=getattr(args, "tape_mm", None),
+        )
+        print_calib_summary(rep)
+        return 0
 
     return 0
 

@@ -228,7 +228,10 @@ def verify_session(session_dir: Path) -> int:
 
         if n_saved < int(0.9 * frames_requested):
             s_report["reasons"].append(f"Frames saved ({n_saved}) < 90% of requested ({frames_requested})")
-            warnings_list.append(f"Stop {s_idx} saved {n_saved}/{frames_requested} frames")
+            fatal_errors.append(f"Stop {s_idx} saved only {n_saved}/{frames_requested} frames (< 90%)")
+        elif n_saved < frames_requested:
+            s_report["reasons"].append(f"Frames saved ({n_saved}) < 100% of requested ({frames_requested})")
+            warnings_list.append(f"Stop {s_idx} saved {n_saved}/{frames_requested} frames (< 100%)")
 
         # Read quality.json
         q_file = attempt_dir / "quality.json"
@@ -292,7 +295,13 @@ def verify_session(session_dir: Path) -> int:
 
         # Status for this stop
         if s_report["reasons"]:
-            if any("clipped" in r.lower() or "missing" in r.lower() or "sha256" in r.lower() for r in s_report["reasons"]):
+            if any(
+                "clipped" in r.lower()
+                or "missing" in r.lower()
+                or "sha256" in r.lower()
+                or "< 90%" in r.lower()
+                for r in s_report["reasons"]
+            ):
                 s_report["status"] = "FAIL"
             else:
                 s_report["status"] = "WARN"
@@ -335,7 +344,7 @@ def verify_session(session_dir: Path) -> int:
     camera_level_pass = True
     if mean_tilt_deg is not None and mean_tilt_deg > 2.0:
         camera_level_pass = False
-        fatal_errors.append(f"Camera tilted {mean_tilt_deg:.1f} deg (> 2.0 deg)")
+        warnings_list.append(f"Camera tilted {mean_tilt_deg:.1f} deg (> 2.0 deg)")
 
     all_stops_pass = (stops_accepted_count == n_stops == 8)
     if not all_stops_pass:
@@ -405,7 +414,7 @@ def verify_session(session_dir: Path) -> int:
     print(f"  - Background calibration:           {bg_pass} ({'present' if bg_calib_present else 'missing'})")
 
     if mean_tilt_deg is not None:
-        tilt_pass = "PASS" if camera_level_pass else "FAIL"
+        tilt_pass = "PASS" if camera_level_pass else "WARN"
         print(f"  - Camera level:                     {tilt_pass} (floor normal tilt {mean_tilt_deg:.1f} deg <= 2.0 deg)")
     else:
         print(f"  - Camera level:                     N/A (no floor plane detected)")

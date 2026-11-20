@@ -341,3 +341,125 @@ def test_verify_session_good_missing_and_clipped():
         with open(clipped_dir / "verify_report.json", "r", encoding="utf-8") as rf:
             rep_c = json.load(rf)
         assert rep_c["verdict"] == "FAIL"
+
+
+def test_verify_session_56_frames_warn():
+    """Verify session with 56/60 frames gives WARN (>=90% and <100%) and exits 0."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sess_dir = Path(tmpdir) / "sess_56"
+        cam = FakeCamera(width=1280, height=720, depth_scale=0.001, depth_units="sensor_units")
+        writer = SessionWriter(
+            root=sess_dir,
+            subject_id="S56",
+            n_stops=8,
+            turn_direction="cw",
+            camera_portrait_rotation="none",
+            intrinsics=cam.intrinsics,
+            depth_scale=cam.depth_scale,
+            depth_units=cam.depth_units,
+            frames_requested=60,
+        )
+
+        col = np.full((720, 1280, 3), 40, dtype=np.uint8)
+        dep = np.full((720, 1280), 2000, dtype=np.uint16)
+        dep[0:20, :] = 0
+        dep[-20:, :] = 0
+        dep[:, 0:20] = 0
+        dep[:, -20:] = 0
+
+        for s_idx in range(8):
+            handle = writer.begin_attempt(s_idx)
+            # Write 56 frames instead of 60
+            n_frames = 56 if s_idx == 0 else 60
+            writer.write_burst(handle, [col] * n_frames, [dep] * n_frames, [i * 0.033 for i in range(n_frames)])
+            writer.write_quality(handle, {
+                "is_flagged": False,
+                "sway_mm": 1.5,
+                "valid_depth_fraction": 0.40,
+                "head_clipped": False,
+                "feet_clipped": False,
+                "border_clip_fraction": 0.0,
+                "foreground_px": 45000,
+            })
+            writer.finish_attempt(handle, accepted=True, reason="Pass", sway_mm=1.5)
+        writer.finalize()
+
+        code = verify_session(sess_dir)
+        assert code == 0
+        with open(sess_dir / "verify_report.json", "r", encoding="utf-8") as rf:
+            rep = json.load(rf)
+        assert rep["verdict"] == "WARN"
+        assert rep["stop_reports"][0]["status"] == "WARN"
+        assert rep["stop_reports"][0]["frames_saved"] == 56
+        assert any("< 100%" in r for r in rep["stop_reports"][0]["reasons"])
+
+
+def test_verify_session_floor_residual_and_3deg_tilt_warn():
+    """Verify FakeCamera floor plane reports residual and flags 3 deg tilt as WARN."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Case A: Level camera (0 deg tilt)
+        dir_0 = Path(tmpdir) / "floor_0deg"
+        cam_0 = FakeCamera(width=1280, height=720, floor=True, floor_tilt_deg=0.0)
+        cam_0.start()
+        writer_0 = SessionWriter(
+            root=dir_0,
+            subject_id="S00",
+            n_stops=8,
+            turn_direction="cw",
+            camera_portrait_rotation="none",
+            intrinsics=cam_0.intrinsics,
+            depth_scale=cam_0.depth_scale,
+            depth_units=cam_0.depth_units,
+            frames_requested=60,
+        )
+        c_frame, d_raw, _, _ = cam_0.read_raw_filtered()
+        for s_idx in range(8):
+            h = writer_0.begin_attempt(s_idx)
+            writer_0.write_burst(h, [c_frame] * 60, [d_raw] * 60, [i * 0.033 for i in range(60)])
+            writer_0.write_quality(h, {"is_flagged": False, "sway_mm": 1.0, "valid_depth_fraction": 0.3})
+            writer_0.finish_attempt(h, accepted=True, reason="Pass", sway_mm=1.0)
+        writer_0.finalize()
+
+        code_0 = verify_session(dir_0)
+        assert code_0 == 0
+        with open(dir_0 / "verify_report.json", "r", encoding="utf-8") as rf:
+            rep_0 = json.load(rf)
+        s0 = rep_0["stop_reports"][0]
+        assert s0["floor_visible"] is True
+        assert s0["floor_residual_mm"] is not None
+        assert s0["floor_residual_mm"] < 10.0  # Clean planar fit
+        assert rep_0["session_checks"]["camera_level"] is True
+
+        # Case B: 3 deg tilt camera
+        dir_3 = Path(tmpdir) / "floor_3deg"
+        cam_3 = FakeCamera(width=1280, height=720, floor=True, floor_tilt_deg=3.0)
+        cam_3.start()
+        writer_3 = SessionWriter(
+            root=dir_3,
+            subject_id="S03",
+            n_stops=8,
+            turn_direction="cw",
+            camera_portrait_rotation="none",
+            intrinsics=cam_3.intrinsics,
+            depth_scale=cam_3.depth_scale,
+            depth_units=cam_3.depth_units,
+            frames_requested=60,
+        )
+        c_frame3, d_raw3, _, _ = cam_3.read_raw_filtered()
+        for s_idx in range(8):
+            h = writer_3.begin_attempt(s_idx)
+            writer_3.write_burst(h, [c_frame3] * 60, [d_raw3] * 60, [i * 0.033 for i in range(60)])
+            writer_3.write_quality(h, {"is_flagged": False, "sway_mm": 1.0, "valid_depth_fraction": 0.3})
+            writer_3.finish_attempt(h, accepted=True, reason="Pass", sway_mm=1.0)
+        writer_3.finalize()
+
+        code_3 = verify_session(dir_3)
+        assert code_3 == 0  # WARN still exits 0
+        with open(dir_3 / "verify_report.json", "r", encoding="utf-8") as rf:
+            rep_3 = json.load(rf)
+        s3 = rep_3["stop_reports"][0]
+        assert s3["floor_visible"] is True
+        assert s3["floor_residual_mm"] is not None
+        assert abs(s3["floor_tilt_deg"] - 3.0) < 0.5  # Matches ~3 deg
+        assert rep_3["session_checks"]["camera_level"] is False
+        assert rep_3["verdict"] == "WARN"
