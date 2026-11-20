@@ -1,11 +1,9 @@
 """
 realsense_measure/body/__init__.py
 
-Core body measurement and capture support sub-package.
+Core body capture and session support sub-package.
 """
 
-from .model import BodyModel, BodyOutput
-from .measure import Measurement, measure_body, is_contour_closed
 from .capture_session import (
     validate_anonymous_subject_id,
     CaptureQualityChecker,
@@ -21,11 +19,6 @@ from .hardware_smoke_test import (
 )
 
 __all__ = [
-    "BodyModel",
-    "BodyOutput",
-    "Measurement",
-    "measure_body",
-    "is_contour_closed",
     "validate_anonymous_subject_id",
     "CaptureQualityChecker",
     "CaptureSessionManifest",

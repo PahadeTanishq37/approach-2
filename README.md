@@ -18,7 +18,7 @@ The system performs a handheld camera sweep around a still human subject (or tar
 - **Full-Body Pipeline**: **Restarting**
   - Experimental Stage 1–26 multi-stop scaffolding and fitting scripts have been cleaned up to enable a fresh, principled architecture.
   - Lessons learned, coordinate frame definitions (ISB), slicing rules, and landmark mapping audits are documented in [`docs/LEGACY_NOTES.md`](docs/LEGACY_NOTES.md).
-  - Reusable foundational modules (`body/model.py`, `body/anny_backend.py`, `body/measure.py`, `body/prior.py`, `body/capture_session.py`, `body/capture_motion.py`, `body/hardware_smoke_test.py`) remain in place.
+  - Reusable foundational modules (`body/capture_session.py`, `body/capture_motion.py`, `body/hardware_smoke_test.py`) remain in place.
 
 ---
 
@@ -157,10 +157,6 @@ python -m pytest tests/test_record_replay_and_head_roi.py
 │   ├── diagnostics/        # Diagnostic utilities
 │   │   └── temporal_noise.py # Temporal depth noise analysis
 │   └── body/               # Preserved full-body foundational modules
-│       ├── model.py        # Abstract BodyModel interface
-│       ├── anny_backend.py # Anny parametric model backend
-│       ├── measure.py      # Mesh slicing & perimeter extraction
-│       ├── prior.py        # Anthropometric shape priors
 │       ├── capture_session.py # Capture session manifests & quality checks
 │       ├── capture_motion.py  # Burst motion & stillness evaluation
 │       └── hardware_smoke_test.py # Sensor hardware checks
@@ -177,8 +173,7 @@ python -m pytest tests/test_record_replay_and_head_roi.py
 ├── tests/                  # Automated test suite
 │   ├── conftest.py         # Pytest sys.path setup
 │   ├── known_issues/       # Documented bug repro test cases
-│   └── body/               # Core unit tests for preserved body modules
-│
+│   └── body/               # Core unit tests for preserved body modules│
 └── docs/                   # Documentation and project assets
     ├── LEGACY_NOTES.md     # Architectural lessons from Stages 1-26
     └── presentation.html   # Interactive presentation slides

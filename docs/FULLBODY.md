@@ -1,5 +1,7 @@
 # Model-Free Full-Body 3D Scanning & Anthropometry Pipeline
 
+> **Status:** Full-body pipeline is being rebuilt as stop-and-go + body-model prior. See plan.
+
 ## 1. Overview and Architecture
 
 The `realsense_measure.fullbody` package implements a model-free full-body 3D scanning and anthropometry system using a single Intel RealSense D455/D455f camera in portrait orientation.
