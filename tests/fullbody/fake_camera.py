@@ -31,6 +31,8 @@ class FakeCamera:
         fps: float = 30.0,
         fx: Optional[float] = None,
         fy: Optional[float] = None,
+        cx: Optional[float] = None,
+        cy: Optional[float] = None,
         empty_scene: bool = False,
     ):
         self.width = width
@@ -41,6 +43,8 @@ class FakeCamera:
         self.fps = float(fps)
         self.fx = fx
         self.fy = fy
+        self.cx = cx
+        self.cy = cy
         self.empty_scene = bool(empty_scene)
 
         self.is_running = False
@@ -57,13 +61,15 @@ class FakeCamera:
     def intrinsics(self) -> Dict[str, Any]:
         fx = self.fx if self.fx is not None else (640.0 if (self.width >= 1280 or self.height >= 1280) else 425.0)
         fy = self.fy if self.fy is not None else fx
+        cx = self.cx if self.cx is not None else (self.width / 2.0)
+        cy = self.cy if self.cy is not None else (self.height / 2.0)
         return {
             "width": self.width,
             "height": self.height,
             "fx": fx,
             "fy": fy,
-            "cx": self.width / 2.0,
-            "cy": self.height / 2.0,
+            "cx": cx,
+            "cy": cy,
             "is_post_rotation": bool(self.width < self.height),
             "is_post_decimation": False,
         }

@@ -43,7 +43,7 @@ except Exception:
             raise ValueError(f"subject_id '{subject_id}' contains '@' (email rejected for PII protection).")
         if " " in subject_id:
             raise ValueError(f"subject_id '{subject_id}' contains spaces (names rejected for PII protection).")
-        pattern = r"^(SUBJ|ANON|PARTICIPANT|SUBJECT|P|TEST|S)(_?[A-Za-z0-9]+)$"
+        pattern = r"^(SUBJ|ANON|PARTICIPANT|SUBJECT|P|TEST|S|BUCKET|OBJ|OBJECT|CYLINDER)(_?[A-Za-z0-9]+)$"
         if not re.match(pattern, subject_id, re.IGNORECASE):
             raise ValueError(
                 f"subject_id '{subject_id}' does not match authorized anonymous format (e.g. 'SUBJ_01', 'S01', 'ANON_42')."
@@ -118,6 +118,16 @@ class SessionWriter:
         depth_units: Optional[str] = None,
         turntable: bool = False,
         background_dir: Optional[Union[str, Path]] = None,
+        cam_height_m: Optional[float] = None,
+        cam_distance_m: Optional[float] = None,
+        cam_tilt_deg: float = 0.0,
+        clothing: Optional[str] = None,
+        pose: str = "A-pose",
+        notes: Optional[str] = None,
+        subject_type: str = "person",
+        object_diameter_mm: Optional[float] = None,
+        protocol_version: str = "stop-and-go-v1",
+        frames_requested: int = 60,
     ):
         self.root = Path(root)
         warn_if_git_ignored(self.root)
@@ -133,6 +143,18 @@ class SessionWriter:
         if depth_units is not None and depth_units not in ("sensor_units", "m"):
             raise ValueError(f"Invalid depth_units '{depth_units}'. Must be 'sensor_units' or 'm'.")
         self.depth_units = depth_units
+
+        # Rig and protocol metadata
+        self.cam_height_m = float(cam_height_m) if cam_height_m is not None else None
+        self.cam_distance_m = float(cam_distance_m) if cam_distance_m is not None else None
+        self.cam_tilt_deg = float(cam_tilt_deg)
+        self.clothing = str(clothing) if clothing is not None else None
+        self.pose = str(pose)
+        self.notes = str(notes) if notes is not None else None
+        self.subject_type = str(subject_type).lower()
+        self.object_diameter_mm = float(object_diameter_mm) if object_diameter_mm is not None else None
+        self.protocol_version = str(protocol_version)
+        self.frames_requested = int(frames_requested)
 
         # Validate intrinsics dictionary
         req_intr = ("width", "height", "fx", "fy", "cx", "cy")
@@ -159,13 +181,14 @@ class SessionWriter:
         self.root.mkdir(parents=True, exist_ok=True)
 
         # Copy background session into session directory if provided
-        if background_dir is not None:
-            bg_p = Path(background_dir)
-            if bg_p.exists() and bg_p.is_dir():
+        self.background_dir = Path(background_dir) if background_dir is not None else None
+        self.background_copied = False
+        if self.background_dir is not None:
+            if self.background_dir.exists() and self.background_dir.is_dir():
                 target_bg = self.root / "background"
                 target_bg.mkdir(parents=True, exist_ok=True)
                 import shutil
-                for item in bg_p.iterdir():
+                for item in self.background_dir.iterdir():
                     if item.is_file():
                         shutil.copy2(item, target_bg / item.name)
                 # Ensure files.sha256 manifest exists for background
@@ -178,6 +201,12 @@ class SessionWriter:
                     with open(sha_file, "w", encoding="utf-8") as sf:
                         for fname, h in sorted(sha_map.items()):
                             sf.write(f"{h}  {fname}\n")
+                self.background_copied = True
+            else:
+                logger.warning(
+                    f"WARNING: Background directory '{self.background_dir}' is missing. "
+                    "Session will not contain local background calibration copy."
+                )
 
         self._finalized = False
         self._init_stops()
@@ -369,10 +398,35 @@ class SessionWriter:
         resolved_units = self.depth_units or "sensor_units"
         storage_scale = self.depth_scale if resolved_units == "sensor_units" else 1.0
 
+        # Build nominal stop angles in turn direction
+        nom_angles = [
+            nominal_angle_deg(i, self.n_stops) for i in range(self.n_stops)
+        ]
+
+        # Background metadata record
+        bg_meta_record: Optional[Dict[str, Any]] = None
+        bg_target = self.root / "background"
+        if bg_target.exists() and (bg_target / "background_depth.npy").exists():
+            bg_meta_record = {
+                "present": True,
+                "relative_path": "background",
+            }
+            sha_f = bg_target / "files.sha256"
+            if sha_f.exists():
+                bg_meta_record["manifest_sha256"] = hashlib.sha256(sha_f.read_bytes()).hexdigest()
+        elif self.background_dir is not None:
+            bg_meta_record = {
+                "present": False,
+                "source_path": str(self.background_dir),
+            }
+
         meta_doc = {
             "schema_version": 2,
             "layout": "stops_v2",
+            "protocol_version": self.protocol_version,
             "subject_id": self.subject_id,
+            "subject_type": self.subject_type,
+            "object_diameter_mm": self.object_diameter_mm,
             "n_stops": self.n_stops,
             "stop_count": self.n_stops,
             "turn_direction": self.turn_direction,
@@ -388,6 +442,17 @@ class SessionWriter:
             "intrinsics": self.intrinsics,
             "camera_config": self.camera_config_snapshot,
             "device_info": self.device_info,
+            "rig_metadata": {
+                "cam_height_m": self.cam_height_m,
+                "cam_distance_m": self.cam_distance_m,
+                "cam_tilt_deg": self.cam_tilt_deg,
+                "clothing": self.clothing,
+                "pose": self.pose,
+                "notes": self.notes,
+            },
+            "nominal_stop_angles": nom_angles,
+            "frames_requested": self.frames_requested,
+            "background": bg_meta_record,
             "created_utc": self.created_utc,
             "software_version": self.software_version,
             "finalized_utc": datetime.now(timezone.utc).isoformat(),

@@ -161,7 +161,7 @@ def render_frame(
         cd_x = max(20, (comp_w - cd_w) // 2)
         cv2.putText(composite, countdown_text, (cd_x, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 165, 255), 2)
     elif state == "TURN_PROMPT":
-        turn_prompt_text = f"TURN TO NEXT POSITION (+{step_deg:.0f}° -> Target {target_angle:.0f}°) [Press SPACE or wait]"
+        turn_prompt_text = f"Stop {stop_idx + 1}/{n_stops}: turn to tick {stop_idx + 1} ({target_angle:.0f} deg) [Press SPACE or wait]"
         (tp_w, tp_h), _ = cv2.getTextSize(turn_prompt_text, cv2.FONT_HERSHEY_SIMPLEX, 0.70, 2)
         tp_x = max(20, (comp_w - tp_w) // 2)
         cv2.putText(composite, turn_prompt_text, (tp_x, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 255), 2)

@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Portrait camera orientation: 'cw', 'ccw', or 'none' for horizontal/landscape mount (default: 'none').")
     p_cap.add_argument("--preview-only", action="store_true", help="Launch live operator preview without recording or saving a session.")
     p_cap.add_argument("--fake", action="store_true", help="Use synthetic FakeCamera instead of hardware RealSense.")
-    p_cap.add_argument("--burst-frames", type=int, default=15, help="Frames per stop burst (default: 15).")
+    p_cap.add_argument("--burst-frames", type=int, default=60, help="Frames per stop burst (default: 60).")
     p_cap.add_argument("--headless", action="store_true", help="Run without opening GUI preview window.")
     p_cap.add_argument("--dist-min", type=float, default=1.70, help="Minimum subject distance in metres (default: 1.70).")
     p_cap.add_argument("--dist-max", type=float, default=2.40, help="Maximum subject distance in metres (default: 2.40).")
@@ -62,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--hold-still-s", type=float, default=2.0, help="Hold-still countdown duration in seconds (default: 2.0).")
     p_cap.add_argument("--motion-limit", type=float, default=10.0, help="Subject motion limit in mm (default: 10.0).")
     p_cap.add_argument("--max-retakes", type=int, default=3, help="Max retakes per stop (default: 3).")
+    p_cap.add_argument("--cam-height-m", type=float, default=None, help="Camera height above floor in metres.")
+    p_cap.add_argument("--cam-distance-m", type=float, default=None, help="Camera standoff distance to subject in metres.")
+    p_cap.add_argument("--cam-tilt-deg", type=float, default=0.0, help="Camera tilt angle in degrees (default: 0.0).")
+    p_cap.add_argument("--clothing", type=str, default=None, help="Subject clothing description (free text).")
+    p_cap.add_argument("--pose", type=str, default="A-pose", help="Subject pose description (default: 'A-pose').")
+    p_cap.add_argument("--notes", type=str, default=None, help="Session notes (free text).")
+    p_cap.add_argument("--subject-type", type=str, choices=["person", "object"], default="person", help="Subject type: 'person' or 'object' (default: 'person').")
+    p_cap.add_argument("--object-diameter-mm", type=float, default=None, help="Object diameter in mm for rigid object mode.")
+    p_cap.add_argument("--no-beep", action="store_true", help="Disable audio cue beeps.")
 
     # 2. check-camera (Stage 27 hardware sanity check snapshot)
     p_chk = subparsers.add_parser("check-camera", help="Verify RealSense orientation, FOV, and depth sanity (no session).")
@@ -133,6 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_vs.add_argument("--out", type=str, default=None, help="Optional path to output validation JSON.")
     p_vs.add_argument("--report", type=str, default=None, help="Optional path to output validation markdown report.")
 
+    # 11. verify-session
+    p_vses = subparsers.add_parser(
+        "verify-session",
+        help="Verify saved capture session without running registration or fusion.",
+    )
+    p_vses.add_argument("--capture", type=str, required=True, help="Path to raw capture session directory.")
+
     return parser
 
 
@@ -161,12 +177,38 @@ def _run_capture(args: argparse.Namespace) -> int:
             w_c, h_c = 1280, 720
         if getattr(args, "portrait", "none") in ("cw", "ccw"):
             w_c, h_c = h_c, w_c
+
+        # If background exists and has matching resolution, inherit intrinsics for FakeCamera
+        fake_fx, fake_fy, fake_cx, fake_cy = None, None, None, None
+        bg_cand = Path(getattr(args, "background", "raw_captures/background"))
+        bg_cand_meta = bg_cand / "background_meta.json"
+        if bg_cand_meta.exists():
+            try:
+                with open(bg_cand_meta, "r", encoding="utf-8") as f:
+                    b_meta = json.load(f)
+                b_intr = b_meta.get("intrinsics", {})
+                b_w = b_intr.get("width", b_meta.get("width"))
+                b_h = b_intr.get("height", b_meta.get("height"))
+                if b_w == w_c and b_h == h_c:
+                    if "fx" in b_intr and "fy" in b_intr:
+                        fake_fx = float(b_intr["fx"])
+                        fake_fy = float(b_intr["fy"])
+                    if "cx" in b_intr and "cy" in b_intr:
+                        fake_cx = float(b_intr["cx"])
+                        fake_cy = float(b_intr["cy"])
+            except Exception:
+                pass
+
         cam = FakeCamera(
             width=w_c,
             height=h_c,
             depth_scale=0.001,
             depth_units="sensor_units",
             fps=30.0,
+            fx=fake_fx,
+            fy=fake_fy,
+            cx=fake_cx,
+            cy=fake_cy,
         )
     else:
         from realsense_measure.fullbody.capture_camera import RealSenseCaptureAdapter, full_body_camera_config
@@ -246,101 +288,107 @@ def _run_capture(args: argparse.Namespace) -> int:
         stream_w = int(cam.intrinsics.get("width", 1280))
         stream_h = int(cam.intrinsics.get("height", 720))
 
+        allow_missing_bg = False
+        bg_depth = None
         if not bg_dir.exists() or not (bg_dir / "background_depth.npy").exists():
             print(
-                f"Capture error: No background depth map found at {bg_dir}. Run capture-background at {stream_w}x{stream_h} first.",
+                f"\nWARNING: No background depth map found at '{bg_dir}'.\n"
+                f"Capture will proceed with distance-gated foreground segmentation without background subtraction.\n"
+                f"For optimal segmentation, run 'python -m realsense_measure.fullbody capture-background' at {stream_w}x{stream_h} first.\n",
                 file=sys.stderr,
             )
-            return 1
-
-        try:
-            bg_depth = np.load(str(bg_dir / "background_depth.npy")).astype(np.float32)
-        except Exception as e:
-            print(f"Capture error: Failed to load background depth: {e}", file=sys.stderr)
-            return 1
-
-        if bg_depth.shape[:2] != (stream_h, stream_w):
-            print(
-                f"Capture error: Background resolution {bg_depth.shape[1]}x{bg_depth.shape[0]} "
-                f"does not match camera stream {stream_w}x{stream_h}. Run capture-background at {stream_w}x{stream_h} first.",
-                file=sys.stderr,
-            )
-            return 1
-
-        # Check background_meta.json
-        meta_file = bg_dir / "background_meta.json"
-        bg_meta: Dict[str, Any] = {}
-        if meta_file.exists():
+            allow_missing_bg = True
+        else:
             try:
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    bg_meta = json.load(f)
+                bg_depth = np.load(str(bg_dir / "background_depth.npy")).astype(np.float32)
             except Exception as e:
-                logger.warning(f"Could not read {meta_file}: {e}")
+                print(f"Capture warning: Failed to load background depth: {e}. Proceeding without background.", file=sys.stderr)
+                allow_missing_bg = True
+                bg_depth = None
 
-        bg_w = bg_meta.get("width")
-        bg_h = bg_meta.get("height")
-        if bg_w is not None and bg_h is not None:
-            if (int(bg_w), int(bg_h)) != (stream_w, stream_h):
+            if bg_depth is not None and bg_depth.shape[:2] != (stream_h, stream_w):
                 print(
-                    f"Capture error: Background resolution {bg_w}x{bg_h} does not match camera stream {stream_w}x{stream_h}. "
-                    f"Run capture-background at {stream_w}x{stream_h} first.",
+                    f"Capture error: Background resolution {bg_depth.shape[1]}x{bg_depth.shape[0]} "
+                    f"does not match camera stream {stream_w}x{stream_h}. Run capture-background at {stream_w}x{stream_h} first.",
                     file=sys.stderr,
                 )
                 return 1
 
-        bg_intr = bg_meta.get("intrinsics")
-        if bg_intr and isinstance(bg_intr, dict):
-            for k in ("fx", "fy", "cx", "cy"):
-                if k in bg_intr and k in cam.intrinsics:
-                    diff_val = abs(float(bg_intr[k]) - float(cam.intrinsics[k]))
-                    if diff_val > 5.0:
+            if bg_depth is not None:
+                # Check background_meta.json
+                meta_file = bg_dir / "background_meta.json"
+                bg_meta: Dict[str, Any] = {}
+                if meta_file.exists():
+                    try:
+                        with open(meta_file, "r", encoding="utf-8") as f:
+                            bg_meta = json.load(f)
+                    except Exception as e:
+                        logger.warning(f"Could not read {meta_file}: {e}")
+
+                bg_w = bg_meta.get("width")
+                bg_h = bg_meta.get("height")
+                if bg_w is not None and bg_h is not None:
+                    if (int(bg_w), int(bg_h)) != (stream_w, stream_h):
                         print(
-                            f"Capture error: Background intrinsic {k}={bg_intr[k]} does not match camera stream {cam.intrinsics[k]} "
-                            f"(diff={diff_val:.1f}px). Run capture-background at {stream_w}x{stream_h} first.",
+                            f"Capture error: Background resolution {bg_w}x{bg_h} does not match camera stream {stream_w}x{stream_h}. "
+                            f"Run capture-background at {stream_w}x{stream_h} first.",
                             file=sys.stderr,
                         )
                         return 1
 
-        # Compare floor-plane normal and camera height to background's and warn
-        bg_normal = bg_meta.get("floor_normal")
-        bg_cam_h = bg_meta.get("camera_height_m")
-        if bg_normal is not None and bg_cam_h is not None:
-            sample_c, sample_r, sample_f, _ = cam.read_raw_filtered()
-            if sample_r is not None:
-                try:
-                    import open3d as o3d
-                    from realsense_measure.fullbody.config import FullBodyConfig
-                    from realsense_measure.fullbody.floor import fit_floor_plane
+                bg_intr = bg_meta.get("intrinsics")
+                if bg_intr and isinstance(bg_intr, dict):
+                    for k in ("fx", "fy", "cx", "cy"):
+                        if k in bg_intr and k in cam.intrinsics:
+                            diff_val = abs(float(bg_intr[k]) - float(cam.intrinsics[k]))
+                            if diff_val > 5.0:
+                                print(
+                                    f"Capture error: Background intrinsic {k}={bg_intr[k]} does not match camera stream {cam.intrinsics[k]} "
+                                    f"(diff={diff_val:.1f}px). Run capture-background at {stream_w}x{stream_h} first.",
+                                    file=sys.stderr,
+                                )
+                                return 1
 
-                    o3d_i = o3d.camera.PinholeCameraIntrinsic(
-                        stream_w,
-                        stream_h,
-                        float(cam.intrinsics["fx"]),
-                        float(cam.intrinsics["fy"]),
-                        float(cam.intrinsics["cx"]),
-                        float(cam.intrinsics["cy"]),
-                    )
-                    scale = cam.depth_scale if cam.depth_units == "sensor_units" else 1.0
-                    d_m_sample = sample_r.astype(np.float32) * scale
-                    cur_floor = fit_floor_plane(d_m_sample, o3d_i, FullBodyConfig())
-                    if cur_floor is not None:
-                        cur_n = cur_floor.normal
-                        bg_n = np.array(bg_normal, dtype=np.float32)
-                        cur_n_norm = cur_n / max(1e-6, np.linalg.norm(cur_n))
-                        bg_n_norm = bg_n / max(1e-6, np.linalg.norm(bg_n))
-                        cos_ang = np.clip(abs(np.dot(cur_n_norm, bg_n_norm)), -1.0, 1.0)
-                        ang_diff_deg = float(np.rad2deg(np.arccos(cos_ang)))
-                        cur_cam_h = abs(float(cur_floor.coefficients[3]))
-                        h_diff_m = abs(cur_cam_h - float(bg_cam_h))
-                        if ang_diff_deg > 1.0 or h_diff_m > 0.03:
-                            warn_msg = (
-                                f"camera moved since background: normal differs by {ang_diff_deg:.2f} deg (>1.0 deg), "
-                                f"height differs by {h_diff_m * 100:.1f} cm (>3.0 cm)"
+                # Compare floor-plane normal and camera height to background's and warn
+                bg_normal = bg_meta.get("floor_normal")
+                bg_cam_h = bg_meta.get("camera_height_m")
+                if bg_normal is not None and bg_cam_h is not None:
+                    sample_c, sample_r, sample_f, _ = cam.read_raw_filtered()
+                    if sample_r is not None:
+                        try:
+                            import open3d as o3d
+                            from realsense_measure.fullbody.config import FullBodyConfig
+                            from realsense_measure.fullbody.floor import fit_floor_plane
+
+                            o3d_i = o3d.camera.PinholeCameraIntrinsic(
+                                stream_w,
+                                stream_h,
+                                float(cam.intrinsics["fx"]),
+                                float(cam.intrinsics["fy"]),
+                                float(cam.intrinsics["cx"]),
+                                float(cam.intrinsics["cy"]),
                             )
-                            print(f"\nWARNING: {warn_msg}")
-                            logger.warning(warn_msg)
-                except Exception as floor_exc:
-                    logger.debug(f"Floor drift check skipped: {floor_exc}")
+                            scale = cam.depth_scale if cam.depth_units == "sensor_units" else 1.0
+                            d_m_sample = sample_r.astype(np.float32) * scale
+                            cur_floor = fit_floor_plane(d_m_sample, o3d_i, FullBodyConfig())
+                            if cur_floor is not None:
+                                cur_n = cur_floor.normal
+                                bg_n = np.array(bg_normal, dtype=np.float32)
+                                cur_n_norm = cur_n / max(1e-6, np.linalg.norm(cur_n))
+                                bg_n_norm = bg_n / max(1e-6, np.linalg.norm(bg_n))
+                                cos_ang = np.clip(abs(np.dot(cur_n_norm, bg_n_norm)), -1.0, 1.0)
+                                ang_diff_deg = float(np.rad2deg(np.arccos(cos_ang)))
+                                cur_cam_h = abs(float(cur_floor.coefficients[3]))
+                                h_diff_m = abs(cur_cam_h - float(bg_cam_h))
+                                if ang_diff_deg > 1.0 or h_diff_m > 0.03:
+                                    warn_msg = (
+                                        f"camera moved since background: normal differs by {ang_diff_deg:.2f} deg (>1.0 deg), "
+                                        f"height differs by {h_diff_m * 100:.1f} cm (>3.0 cm)"
+                                    )
+                                    print(f"\nWARNING: {warn_msg}")
+                                    logger.warning(warn_msg)
+                        except Exception as floor_exc:
+                            logger.debug(f"Floor drift check skipped: {floor_exc}")
 
         writer = SessionWriter(
             root=out_dir,
@@ -353,7 +401,17 @@ def _run_capture(args: argparse.Namespace) -> int:
             depth_units=cam.depth_units,
             device_info=cam.device_info(),
             turntable=getattr(args, "turntable", False),
-            background_dir=bg_dir if bg_dir.exists() else None,
+            background_dir=bg_dir if (bg_dir.exists() and (bg_dir / "background_depth.npy").exists()) else None,
+            cam_height_m=getattr(args, "cam_height_m", None),
+            cam_distance_m=getattr(args, "cam_distance_m", None),
+            cam_tilt_deg=getattr(args, "cam_tilt_deg", 0.0),
+            clothing=getattr(args, "clothing", None),
+            pose=getattr(args, "pose", "A-pose"),
+            notes=getattr(args, "notes", None),
+            subject_type=getattr(args, "subject_type", "person"),
+            object_diameter_mm=getattr(args, "object_diameter_mm", None),
+            protocol_version="stop-and-go-v1",
+            frames_requested=args.burst_frames,
         )
 
         hold_still_s = float(getattr(args, "hold_still_s", 2.0))
@@ -367,6 +425,11 @@ def _run_capture(args: argparse.Namespace) -> int:
             dist_max_m=getattr(args, "dist_max", 2.40),
             require_head_feet=not getattr(args, "no_head_feet_check", False),
             turn_prompt_timeout_s=getattr(args, "turn_prompt_timeout", 10.0),
+            burst_timeout_s=8.0,
+            subject_type=getattr(args, "subject_type", "person"),
+            object_diameter_mm=getattr(args, "object_diameter_mm", None),
+            audio_cues=not getattr(args, "no_beep", False),
+            allow_missing_background=allow_missing_bg,
         )
 
         landmark_fn = None
@@ -428,7 +491,7 @@ def _run_capture(args: argparse.Namespace) -> int:
     for s_idx in range(args.stops):
         s_folder = out_dir / f"stop_{s_idx:02d}"
         if s_folder.exists():
-            n_files = len(list(s_folder.glob("*")))
+            n_files = len([f for f in s_folder.rglob("*") if f.is_file()])
             print(f"  - stop_{s_idx:02d}: {n_files} files")
         else:
             print(f"  - stop_{s_idx:02d}: not created")
@@ -1175,6 +1238,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             report_path=args.report,
         )
         return 0
+
+    elif args.subcommand == "verify-session":
+        from realsense_measure.fullbody.verify_session import verify_session
+        return verify_session(Path(args.capture))
 
     return 0
 

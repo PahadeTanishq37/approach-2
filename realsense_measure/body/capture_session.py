@@ -51,7 +51,7 @@ def validate_anonymous_subject_id(subject_id: Optional[str]) -> str:
     if " " in subject_id:
         raise ValueError(f"subject_id '{subject_id}' contains spaces (personal names rejected for PII protection).")
 
-    pattern = r"^(SUBJ|ANON|PARTICIPANT|SUBJECT|P|TEST|S)(_?[A-Za-z0-9]+)$"
+    pattern = r"^(SUBJ|ANON|PARTICIPANT|SUBJECT|P|TEST|S|BUCKET|OBJ|OBJECT|CYLINDER)(_?[A-Za-z0-9]+)$"
     if not re.match(pattern, subject_id, re.IGNORECASE):
         raise ValueError(
             f"subject_id '{subject_id}' does not match authorized anonymous format (e.g. 'SUBJ_01', 'S01', 'ANON_42')."

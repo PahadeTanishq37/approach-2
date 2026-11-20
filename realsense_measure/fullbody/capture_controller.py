@@ -65,8 +65,8 @@ class CaptureThresholds:
     Comments distinguish existing defaults from new/untested Stage 27 thresholds.
     """
 
-    # Burst frame count: default 15 frames
-    burst_frames: int = 15
+    # Burst frame count: default 60 frames
+    burst_frames: int = 60
 
     # Maximum retake attempts allowed per stop before aborting
     max_retakes: int = 3
@@ -97,7 +97,19 @@ class CaptureThresholds:
     position_check_timeout_s: float = 15.0
 
     # NEW/UNTESTED: Timeout for burst acquisition (seconds)
-    burst_timeout_s: float = 5.0
+    burst_timeout_s: float = 8.0
+
+    # Subject mode: "person" or "object"
+    subject_type: str = "person"
+
+    # Optional object diameter in mm for rigid object mode
+    object_diameter_mm: Optional[float] = None
+
+    # Audio cue beeps at hold-start and burst-end
+    audio_cues: bool = True
+
+    # Allow proceeding with depth-window segmentation when background depth map is missing
+    allow_missing_background: bool = False
 
 
 class ControllerState(str, Enum):
@@ -115,24 +127,71 @@ class ControllerState(str, Enum):
     ABORT = "ABORT"
 
 
+def play_audio_cue(cue: str, enabled: bool = True) -> None:
+    """
+    Play an audio cue asynchronously so it never blocks the control loop.
+    cue: 'hold_start' ("hold still") -> 800 Hz, 150 ms
+         'burst_end'  ("turn now")   -> 1200 Hz, 250 ms
+    Safe fallback to terminal bell, ignores exceptions on headless/virtual systems.
+    """
+    if not enabled:
+        return
+
+    import sys
+    import threading
+
+    def _beep():
+        try:
+            if sys.platform == "win32":
+                import winsound
+                if cue == "hold_start":
+                    winsound.Beep(800, 150)
+                elif cue == "burst_end":
+                    winsound.Beep(1200, 250)
+                else:
+                    winsound.Beep(1000, 200)
+            else:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_beep, daemon=True)
+    t.start()
+
+
 def subject_mask(
     depth_m: np.ndarray,
     bg_depth: Optional[np.ndarray],
     cfg: Optional[FullBodyConfig] = None,
+    allow_missing: bool = False,
 ) -> np.ndarray:
     """
     Extract foreground subject mask from depth map using background-depth subtraction.
-    Strictly requires matching background depth map. No fallback to whole-scene depth.
+    Strictly requires matching background depth map unless allow_missing=True.
     """
     h, w = depth_m.shape[:2]
+    cfg_eval = cfg or FullBodyConfig()
     if bg_depth is None:
+        if allow_missing:
+            d_min = cfg_eval.capture_dist_min_m - 0.25
+            d_max = cfg_eval.capture_dist_max_m + 0.25
+            raw_mask = (depth_m >= d_min) & (depth_m <= d_max) & (depth_m > 0.1)
+            if not np.any(raw_mask):
+                return np.zeros((h, w), dtype=bool)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                raw_mask.astype(np.uint8), connectivity=8
+            )
+            if num_labels <= 1:
+                return np.zeros((h, w), dtype=bool)
+            largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            return labels == largest_label
         raise RuntimeError(f"No background depth map loaded. Run capture-background at {w}x{h} first.")
     if bg_depth.shape[:2] != (h, w):
         raise RuntimeError(
             f"Background resolution {bg_depth.shape[1]}x{bg_depth.shape[0]} "
             f"does not match live stream {w}x{h}. Run capture-background at {w}x{h} first."
         )
-    cfg_eval = cfg or FullBodyConfig()
     from realsense_measure.fullbody.fusion import compute_foreground_mask
     return compute_foreground_mask(depth_m, bg_depth, cfg_eval)
 
@@ -150,18 +209,19 @@ def default_quality_fn(
     """
     Numpy-only quality assessment for a captured burst using foreground subject mask:
     - Subject presence and foreground pixel count
-    - Head margin and sole margin >= 4% from foreground bbox
-    - Border clipping from top/left/right border touch
+    - Head margin and sole margin >= 4% from foreground bbox (person mode)
+    - Border clipping from top/left/right border touch (person mode) or all 4 borders (object mode)
     - Sway: median per-frame shift of foreground centroid and torso depth (mm)
     - Temporal depth standard deviation (mm)
     """
     th = thresholds or CaptureThresholds()
     n_frames = len(burst_depths)
-    if n_frames < th.burst_frames:
+    min_required_frames = max(1, int(0.9 * th.burst_frames))
+    if n_frames < min_required_frames:
         return {
             "is_flagged": True,
             "reasons": [
-                f"Burst frame count ({n_frames}) is less than required burst_frames ({th.burst_frames})"
+                f"Burst frame count ({n_frames}) is less than 90% of required burst_frames ({th.burst_frames})"
             ],
             "sway_mm": 999.0,
             "motion_mm": 999.0,
@@ -171,6 +231,8 @@ def default_quality_fn(
             "head_clipped": False,
             "feet_clipped": False,
             "foreground_px": 0,
+            "frames_requested": th.burst_frames,
+            "frames_saved": n_frames,
         }
 
     # Normalize depth to metres float32 for computation
@@ -196,18 +258,21 @@ def default_quality_fn(
     feet_clipped_count = 0
     border_clip_fractions: List[float] = []
     fg_masks: List[np.ndarray] = []
+    is_object = (th.subject_type == "object")
 
     for d_m in depth_m_list:
-        fg_m = subject_mask(d_m, bg_depth, cfg_eval)
+        fg_m = subject_mask(d_m, bg_depth, cfg_eval, allow_missing=th.allow_missing_background)
         fg_masks.append(fg_m)
         ys, xs = np.nonzero(fg_m)
         fg_count = len(ys)
         fg_px_counts.append(fg_count)
 
-        if fg_count < 100:
+        min_px = 50 if is_object else 100
+        if fg_count < min_px:
             border_clip_fractions.append(0.0)
-            head_clipped_count += 1
-            feet_clipped_count += 1
+            if not is_object:
+                head_clipped_count += 1
+                feet_clipped_count += 1
             per_frame_centroids.append((0.0, 0.0, 0.0))
             per_frame_torso_z.append(0.0)
             continue
@@ -215,19 +280,26 @@ def default_quality_fn(
         y_min, y_max = int(np.min(ys)), int(np.max(ys))
         x_min, x_max = int(np.min(xs)), int(np.max(xs))
 
-        # Head margin and sole margin checks from foreground bbox (>= 4% required)
-        head_margin_pct = float(y_min) / float(h) * 100.0
-        sole_margin_pct = float((h - 1) - y_max) / float(h) * 100.0
-        if head_margin_pct < 4.0:
-            head_clipped_count += 1
-        if sole_margin_pct < 4.0:
-            feet_clipped_count += 1
-
-        # Side clipping = top, left, right border touching (bottom border excluded)
         top_touch = np.count_nonzero(fg_m[0, :])
+        bottom_touch = np.count_nonzero(fg_m[-1, :])
         left_touch = np.count_nonzero(fg_m[:, 0])
         right_touch = np.count_nonzero(fg_m[:, -1])
-        clip_px = int(top_touch + left_touch + right_touch)
+
+        if not is_object:
+            # Head margin and sole margin checks from foreground bbox (>= 4% required)
+            head_margin_pct = float(y_min) / float(h) * 100.0
+            sole_margin_pct = float((h - 1) - y_max) / float(h) * 100.0
+            if head_margin_pct < 4.0:
+                head_clipped_count += 1
+            if sole_margin_pct < 4.0:
+                feet_clipped_count += 1
+
+            # Side clipping = top, left, right border touching (bottom border excluded)
+            clip_px = int(top_touch + left_touch + right_touch)
+        else:
+            # In object mode, object must not touch any of the 4 borders
+            clip_px = int(top_touch + bottom_touch + left_touch + right_touch)
+
         border_clip_fractions.append(float(clip_px) / float(fg_count))
 
         # Centroid
@@ -287,15 +359,21 @@ def default_quality_fn(
         reasons.append(
             f"Subject sway {sway_mm:.1f} mm exceeds motion limit {th.motion_limit_mm:.1f} mm"
         )
-    if th.require_head_feet and head_clipped:
-        reasons.append(f"Head margin < 4.0% in {head_clipped_count}/{n_frames} frames")
-    if th.require_head_feet and feet_clipped:
-        reasons.append(f"Sole margin < 4.0% in {feet_clipped_count}/{n_frames} frames")
-    if mean_border_clip > th.max_border_clip_frac:
+    if not is_object:
+        if th.require_head_feet and head_clipped:
+            reasons.append(f"Head margin < 4.0% in {head_clipped_count}/{n_frames} frames")
+        if th.require_head_feet and feet_clipped:
+            reasons.append(f"Sole margin < 4.0% in {feet_clipped_count}/{n_frames} frames")
+    if is_object and mean_border_clip > 0.0:
+        reasons.append(
+            f"Object clipped by image border ({mean_border_clip * 100:.2f}% border clipping)"
+        )
+    elif mean_border_clip > th.max_border_clip_frac:
         reasons.append(
             f"Border clipping fraction {mean_border_clip:.3f} exceeds limit {th.max_border_clip_frac:.3f}"
         )
-    if mean_fg_px < 500:
+    min_fg_limit = 100 if is_object else 500
+    if mean_fg_px < min_fg_limit:
         reasons.append("Insufficient foreground subject pixels")
 
     is_flagged = len(reasons) > 0
@@ -311,6 +389,8 @@ def default_quality_fn(
         "head_clipped": head_clipped,
         "feet_clipped": feet_clipped,
         "foreground_px": mean_fg_px,
+        "frames_requested": th.burst_frames,
+        "frames_saved": n_frames,
     }
 
 
@@ -344,10 +424,15 @@ class CaptureController:
         cam_w = int(intr.get("width", 848))
         cam_h = int(intr.get("height", 480))
         if self.bg_depth is None:
-            raise RuntimeError(
-                f"No background depth map loaded. Run capture-background at {cam_w}x{cam_h} first."
-            )
-        if self.bg_depth.shape[:2] != (cam_h, cam_w):
+            if not self.thresholds.allow_missing_background:
+                raise RuntimeError(
+                    f"No background depth map loaded. Run capture-background at {cam_w}x{cam_h} first."
+                )
+            else:
+                logger.warning(
+                    "WARNING: No background depth map loaded. Proceeding with distance-gated foreground segmentation."
+                )
+        elif self.bg_depth.shape[:2] != (cam_h, cam_w):
             raise RuntimeError(
                 f"Background resolution {self.bg_depth.shape[1]}x{self.bg_depth.shape[0]} "
                 f"does not match camera stream {cam_w}x{cam_h}. Run capture-background at {cam_w}x{cam_h} first."
@@ -412,6 +497,8 @@ class CaptureController:
         )
         self.state = new_state
         self._state_entry_time = now
+        if new_state == ControllerState.WAIT_STILL:
+            play_audio_cue("hold_start", getattr(self.thresholds, "audio_cues", True))
 
     def step(self, now: float) -> ControllerState:
         """
@@ -478,7 +565,7 @@ class CaptureController:
         h, w = depth.shape[:2]
         d_m = depth.astype(np.float32) * (self.camera.depth_scale if self.camera.depth_units == "sensor_units" else 1.0)
 
-        fg_mask = subject_mask(d_m, self.bg_depth, self.cfg)
+        fg_mask = subject_mask(d_m, self.bg_depth, self.cfg, allow_missing=self.thresholds.allow_missing_background)
         fg_count = int(np.count_nonzero(fg_mask))
         total_px = h * w
         fg_fraction = float(fg_count) / float(total_px)
@@ -487,6 +574,7 @@ class CaptureController:
         self._latest_fg_count = fg_count
 
         is_present = False
+        is_object = (self.thresholds.subject_type == "object")
         if fg_count > 0:
             ys, xs = np.nonzero(fg_mask)
             y_min, y_max = int(np.min(ys)), int(np.max(ys))
@@ -497,9 +585,13 @@ class CaptureController:
             self._latest_bbox_h_pct = bbox_h_ratio * 100.0
             self._latest_distance_m = float(np.median(d_m[ys, xs]))
 
-            # WAIT_FOR_SUBJECT: subject present when foreground pixels >= 0.5% and bbox height >= 40%
-            if fg_fraction >= 0.005 and bbox_h_ratio >= 0.40:
-                is_present = True
+            if is_object:
+                if fg_fraction >= 0.002 and bbox_h_ratio >= 0.10:
+                    is_present = True
+            else:
+                # WAIT_FOR_SUBJECT: subject present when foreground pixels >= 0.5% and bbox height >= 40%
+                if fg_fraction >= 0.005 and bbox_h_ratio >= 0.40:
+                    is_present = True
         else:
             self._latest_bbox = None
             self._latest_bbox_h_pct = 0.0
@@ -515,8 +607,12 @@ class CaptureController:
             self._wait_subject_consecutive = 0
             if fg_count == 0:
                 self._latest_rejection_reason = "Waiting for subject (no foreground)"
-            elif fg_fraction < 0.005:
+            elif is_object and fg_fraction < 0.002:
+                self._latest_rejection_reason = f"Waiting for object (foreground {fg_fraction*100:.2f}% < 0.2%)"
+            elif not is_object and fg_fraction < 0.005:
                 self._latest_rejection_reason = f"Waiting for subject (foreground {fg_fraction*100:.2f}% < 0.5%)"
+            elif is_object:
+                self._latest_rejection_reason = f"Waiting for object (bbox height {self._latest_bbox_h_pct:.1f}% < 10%)"
             else:
                 self._latest_rejection_reason = f"Waiting for subject (bbox height {self._latest_bbox_h_pct:.1f}% < 40%)"
 
@@ -533,13 +629,15 @@ class CaptureController:
         h, w = depth.shape[:2]
         d_m = depth.astype(np.float32) * (self.camera.depth_scale if self.camera.depth_units == "sensor_units" else 1.0)
 
-        fg_mask = subject_mask(d_m, self.bg_depth, self.cfg)
+        fg_mask = subject_mask(d_m, self.bg_depth, self.cfg, allow_missing=self.thresholds.allow_missing_background)
         ys, xs = np.nonzero(fg_mask)
         fg_count = len(ys)
         self._latest_fg_mask = fg_mask
         self._latest_fg_count = fg_count
+        is_object = (self.thresholds.subject_type == "object")
+        min_fg_pos = 50 if is_object else 100
 
-        if fg_count < 100:
+        if fg_count < min_fg_pos:
             self._latest_rejection_reason = "No subject foreground detected"
             self._latest_bbox = None
             if (now - self._state_entry_time) > self.thresholds.position_check_timeout_s:
@@ -555,30 +653,14 @@ class CaptureController:
         self._latest_distance_m = med_dist
         self._latest_valid_depth_pct = float(fg_count) / float(h * w) * 100.0
 
-        # 2. Bbox height >= 60% of image height
         bbox_h = y_max - y_min + 1
         bbox_h_pct = float(bbox_h) / float(h) * 100.0
         self._latest_bbox_h_pct = bbox_h_pct
 
-        # 3. Head margin and sole margin as % of image height from foreground bbox (>= 4% each)
-        head_margin_px = y_min
-        head_margin_pct = float(head_margin_px) / float(h) * 100.0
-        self._latest_head_margin_pct = head_margin_pct
-        self._latest_head_visible = (head_margin_pct >= 4.0)
-
-        sole_margin_px = (h - 1) - y_max
-        sole_margin_pct = float(sole_margin_px) / float(h) * 100.0
-        self._latest_sole_margin_pct = sole_margin_pct
-        self._latest_feet_visible = (sole_margin_pct >= 4.0)
-
-        # 4. Side clipping = foreground pixels touching left/right/top borders
-        # (bottom border counts only as sole margin test)
         top_touch = np.count_nonzero(fg_mask[0, :])
+        bottom_touch = np.count_nonzero(fg_mask[-1, :])
         left_touch = np.count_nonzero(fg_mask[:, 0])
         right_touch = np.count_nonzero(fg_mask[:, -1])
-        side_clip_px = int(top_touch + left_touch + right_touch)
-        side_clip_pct = float(side_clip_px) / float(fg_count) * 100.0
-        self._latest_clip_pct = side_clip_pct
 
         reasons = []
         if med_dist < self.thresholds.dist_min_m:
@@ -586,17 +668,44 @@ class CaptureController:
         elif med_dist > self.thresholds.dist_max_m:
             reasons.append(f"Subject too far ({med_dist:.2f} m > {self.thresholds.dist_max_m:.2f} m)")
 
-        if bbox_h_pct < 60.0:
-            reasons.append(f"Bbox height too small ({bbox_h_pct:.1f}% < 60.0%)")
+        if is_object:
+            all_clip_px = int(top_touch + bottom_touch + left_touch + right_touch)
+            self._latest_clip_pct = float(all_clip_px) / float(fg_count) * 100.0
+            self._latest_head_margin_pct = float(y_min) / float(h) * 100.0
+            self._latest_sole_margin_pct = float((h - 1) - y_max) / float(h) * 100.0
+            self._latest_head_visible = (top_touch == 0)
+            self._latest_feet_visible = (bottom_touch == 0)
+            if all_clip_px > 0:
+                reasons.append(f"Object border clipped ({all_clip_px} px)")
+        else:
+            # Person mode: head margin and sole margin >= 4% from foreground bbox
+            head_margin_px = y_min
+            head_margin_pct = float(head_margin_px) / float(h) * 100.0
+            self._latest_head_margin_pct = head_margin_pct
+            self._latest_head_visible = (head_margin_pct >= 4.0)
 
-        if head_margin_pct < 4.0:
-            reasons.append(f"Head margin too small ({head_margin_pct:.1f}% < 4.0%)")
+            sole_margin_px = (h - 1) - y_max
+            sole_margin_pct = float(sole_margin_px) / float(h) * 100.0
+            self._latest_sole_margin_pct = sole_margin_pct
+            self._latest_feet_visible = (sole_margin_pct >= 4.0)
 
-        if sole_margin_pct < 4.0:
-            reasons.append(f"Sole margin too small ({sole_margin_pct:.1f}% < 4.0%)")
+            # Side clipping = foreground pixels touching left/right/top borders
+            # (bottom border counts only as sole margin test)
+            side_clip_px = int(top_touch + left_touch + right_touch)
+            side_clip_pct = float(side_clip_px) / float(fg_count) * 100.0
+            self._latest_clip_pct = side_clip_pct
 
-        if side_clip_px > 0:
-            reasons.append(f"Side/top border clipped ({side_clip_px} px)")
+            if bbox_h_pct < 60.0:
+                reasons.append(f"Bbox height too small ({bbox_h_pct:.1f}% < 60.0%)")
+
+            if self.thresholds.require_head_feet and head_margin_pct < 4.0:
+                reasons.append(f"Head margin too small ({head_margin_pct:.1f}% < 4.0%)")
+
+            if self.thresholds.require_head_feet and sole_margin_pct < 4.0:
+                reasons.append(f"Sole margin too small ({sole_margin_pct:.1f}% < 4.0%)")
+
+            if side_clip_px > 0:
+                reasons.append(f"Side/top border clipped ({side_clip_px} px)")
 
         if reasons:
             self._latest_rejection_reason = "; ".join(reasons)
@@ -610,6 +719,12 @@ class CaptureController:
 
     def _step_turn_prompt(self, now: float, cmd: Optional[str]) -> None:
         elapsed = now - self._state_entry_time
+        if not hasattr(self, "_last_turn_prompt_stop") or self._last_turn_prompt_stop != self.current_stop:
+            self._last_turn_prompt_stop = self.current_stop
+            step_deg = 360.0 / max(1, self.n_stops)
+            target_deg = (self.current_stop * step_deg) % 360.0
+            print(f"Stop {self.current_stop + 1}/{self.n_stops}: turn to tick {self.current_stop + 1} ({target_deg:.0f} deg)")
+
         if cmd == "confirm" or elapsed >= self.thresholds.turn_prompt_timeout_s:
             self._stillness_window.clear()
             self._transition(ControllerState.WAIT_STILL, now)
@@ -629,7 +744,7 @@ class CaptureController:
         h, w = depth.shape[:2]
         d_m = depth.astype(np.float32) * (self.camera.depth_scale if self.camera.depth_units == "sensor_units" else 1.0)
 
-        fg_mask = subject_mask(d_m, self.bg_depth, self.cfg)
+        fg_mask = subject_mask(d_m, self.bg_depth, self.cfg, allow_missing=self.thresholds.allow_missing_background)
         ys, xs = np.nonzero(fg_mask)
         self._latest_fg_mask = fg_mask
         self._latest_fg_count = len(ys)
@@ -720,6 +835,7 @@ class CaptureController:
 
         n_saved = len(self._burst_depths)
         fg_px = int(report.get("foreground_px", 0))
+        play_audio_cue("burst_end", getattr(self.thresholds, "audio_cues", True))
 
         if not report.get("is_flagged", False):
             handle = self.writer.begin_attempt(self.current_stop)
