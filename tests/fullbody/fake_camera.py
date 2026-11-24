@@ -56,12 +56,24 @@ class FakeCamera:
         self.is_running = False
         self.frame_id = 0
         self.fault: Optional[str] = None
+        self._last_colorized: Optional[np.ndarray] = None
 
     def start(self) -> None:
         self.is_running = True
 
     def stop(self) -> None:
         self.is_running = False
+
+    @property
+    def last_colorized(self) -> Optional[np.ndarray]:
+        return self._last_colorized
+
+    @property
+    def stream_profiles(self) -> Dict[str, Any]:
+        return {
+            "depth": {"width": self.width, "height": self.height, "fps": int(self.fps), "format": "z16"},
+            "color": {"width": self.width, "height": self.height, "fps": int(self.fps), "format": "bgr8"},
+        }
 
     @property
     def intrinsics(self) -> Dict[str, Any]:
@@ -93,6 +105,15 @@ class FakeCamera:
             "name": "Synthetic FakeCamera D455f",
             "serial_number": "SIM_001",
             "firmware_version": "9.9.9",
+            "stream_profile": f"{self.width}x{self.height}@{int(self.fps)}fps",
+            "stream_profiles": self.stream_profiles,
+            "filter_settings": {
+                "decimation": False,
+                "spatial": False,
+                "temporal": False,
+                "hole_filling": False,
+                "raw_only": True,
+            },
         }
 
     def set_fault(self, fault: Optional[str]) -> None:

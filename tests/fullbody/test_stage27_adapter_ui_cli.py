@@ -305,6 +305,10 @@ def test_cli_check_camera_fake():
         assert "head_in_frame:" in txt
         assert "feet_in_frame:" in txt
         assert "floor_visible:" in txt
+        assert "requested_resolution: 1280x720" in txt
+        assert "stream_profile_match: True" in txt
+        assert "foreground_blob_found:" in txt
+        assert "central_20x20_median_depth_m:" in txt
         assert "automatic_acceptance:" in txt
 
 
@@ -510,6 +514,172 @@ def test_modules_compatibility_720p_and_480p():
         # 5. Keypoint detector
         pts_2d, confs, vis, p_mask = detector.detect_with_mask(color, d_m)
         assert isinstance(pts_2d, dict)
+
+
+def test_colorize_depth_background_preservation():
+    """Verify colorize_depth_m does not zero out valid depths > 3.0m."""
+    from realsense_measure.fullbody.capture_ui import colorize_depth_m
+
+    depths = np.array([[0.0, 0.04, 0.5, 2.0, 3.5, 5.0, np.nan]], dtype=np.float32)
+    colored = colorize_depth_m(depths)
+
+    # 0.0, 0.04, and NaN must be black
+    assert np.all(colored[0, 0] == [0, 0, 0])
+    assert np.all(colored[0, 1] == [0, 0, 0])
+    assert np.all(colored[0, 6] == [0, 0, 0])
+
+    # Valid depths at 0.5m, 2.0m, 3.5m, 5.0m must NOT be black
+    assert not np.all(colored[0, 2] == [0, 0, 0])
+    assert not np.all(colored[0, 3] == [0, 0, 0])
+    assert not np.all(colored[0, 4] == [0, 0, 0])
+    assert not np.all(colored[0, 5] == [0, 0, 0])
+
+
+def test_check_camera_preview_fake(monkeypatch, tmp_path):
+    """Verify check-camera --preview with fake camera opens WINDOW_NORMAL and handles frames safely."""
+    import cv2
+
+    created_windows = []
+    shown_frames = []
+
+    def mock_named_window(name, flag):
+        created_windows.append((name, flag))
+
+    def mock_imshow(name, img):
+        shown_frames.append((name, img.shape))
+
+    # Exit immediately after first waitKey
+    monkeypatch.setattr(cv2, "namedWindow", mock_named_window)
+    monkeypatch.setattr(cv2, "imshow", mock_imshow)
+    monkeypatch.setattr(cv2, "waitKey", lambda delay: ord("q"))
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda: None)
+
+    argv = ["check-camera", "--fake", "--preview", "--out", str(tmp_path)]
+    ret = main(argv)
+    assert ret == 0
+    assert len(created_windows) == 1
+    assert created_windows[0][1] == cv2.WINDOW_NORMAL
+    assert len(shown_frames) >= 1
+    # Frame width must fit <= 1200
+    assert shown_frames[0][1][1] <= 1200
+
+
+def test_check_camera_resolution_negotiation_and_framing(tmp_path):
+    """Verify check-camera handles --resolution 848x480 and 1280x720, reporting framing info."""
+    for res in ("1280x720", "848x480"):
+        res_dir = tmp_path / f"chk_{res}"
+        argv = ["check-camera", "--fake", "--resolution", res, "--out", str(res_dir)]
+        assert main(argv) == 0
+
+        metrics_file = res_dir / "check" / "check_metrics.txt"
+        assert metrics_file.exists()
+        txt = metrics_file.read_text(encoding="utf-8")
+        assert f"requested_resolution: {res}" in txt
+        assert f"negotiated_depth_stream: {res}@30fps" in txt
+        assert f"negotiated_color_stream: {res}@30fps" in txt
+        assert "stream_profile_match: True" in txt
+        assert "foreground_blob_found: True" in txt
+        assert "touches_border:" in txt
+        assert "central_20x20_median_depth_m:" in txt
+
+
+def test_preview_colorizer_preserves_raw_capture_bytes(monkeypatch, tmp_path):
+    """
+    Confirm preview-only changes (WINDOW_NORMAL downscale, depth colorization,
+    cam.last_colorized) do not alter any saved raw frames, raw-only filter settings,
+    or files written by capture.
+    Compares raw PNG and NPY frames byte-for-byte between headless and preview-enabled runs.
+    """
+    import cv2
+    import json
+
+    # Shared background
+    bg_dir = tmp_path / "bg_calib"
+    bg_argv = [
+        "capture-background",
+        "--out", str(bg_dir),
+        "--burst-frames", "2",
+        "--fake",
+    ]
+    assert main(bg_argv) == 0
+
+    # Run 1: Headless capture (no preview rendering or colorization)
+    dir_headless = tmp_path / "cap_headless"
+    argv_headless = [
+        "capture",
+        "--out", str(dir_headless),
+        "--subject-id", "SUBJ_01",
+        "--stops", "2",
+        "--burst-frames", "3",
+        "--fake",
+        "--background", str(bg_dir),
+        "--turn-prompt-timeout", "0.05",
+        "--hold-still-s", "0.05",
+        "--headless",
+        "--no-beep",
+    ]
+    assert main(argv_headless) == 0
+
+    # Run 2: Preview-enabled capture (drives render_frame, downscaling, colorize_depth_m)
+    # Monkeypatch cv2 so GUI displays headlessly during the test
+    preview_rendered = []
+
+    def mock_imshow(name, img):
+        preview_rendered.append(img.shape)
+
+    monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "imshow", mock_imshow)
+    monkeypatch.setattr(cv2, "waitKey", lambda *a, **k: 32)  # confirm prompt
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+
+    dir_preview = tmp_path / "cap_preview"
+    argv_preview = [
+        "capture",
+        "--out", str(dir_preview),
+        "--subject-id", "SUBJ_01",
+        "--stops", "2",
+        "--burst-frames", "3",
+        "--fake",
+        "--background", str(bg_dir),
+        "--turn-prompt-timeout", "0.05",
+        "--hold-still-s", "0.05",
+        "--no-beep",
+    ]
+    assert main(argv_preview) == 0
+    assert len(preview_rendered) > 0, "Preview rendering should have been triggered"
+
+    # Compare raw files byte-for-byte across all stops
+    for stop_idx in (0, 1):
+        s_head = dir_headless / f"stop_{stop_idx:02d}"
+        s_prev = dir_preview / f"stop_{stop_idx:02d}"
+        assert s_head.exists() and s_prev.exists()
+
+        head_files = sorted(f.name for f in s_head.glob("*"))
+        prev_files = sorted(f.name for f in s_prev.glob("*"))
+        assert head_files == prev_files
+
+        for fname in head_files:
+            f1 = s_head / fname
+            f2 = s_prev / fname
+            if fname.endswith(".png") or fname.endswith(".npy"):
+                b1 = f1.read_bytes()
+                b2 = f2.read_bytes()
+                assert b1 == b2, f"Byte mismatch in raw frame {fname} between headless and preview runs!"
+            elif fname == "hashes.json":
+                h1 = json.loads(f1.read_text(encoding="utf-8"))
+                h2 = json.loads(f2.read_text(encoding="utf-8"))
+                assert h1 == h2, f"SHA-256 hash mismatch in hashes.json between headless and preview runs!"
+
+    # Verify camera filter settings in meta.json
+    meta = json.loads((dir_preview / "meta.json").read_text(encoding="utf-8"))
+    filters = meta.get("device_info", {}).get("filter_settings", {})
+    assert filters.get("raw_only") is True
+    assert filters.get("spatial") is False
+    assert filters.get("temporal") is False
+    assert filters.get("hole_filling") is False
+    assert filters.get("decimation") is False
+
+
 
 
 

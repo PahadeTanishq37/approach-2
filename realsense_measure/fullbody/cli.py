@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 2. check-camera (Stage 27 hardware sanity check snapshot)
     p_chk = subparsers.add_parser("check-camera", help="Verify RealSense orientation, FOV, and depth sanity (no session).")
+    p_chk.add_argument("--resolution", type=str, choices=["1280x720", "848x480"], default="1280x720", help="Camera stream resolution: '1280x720' (default) or '848x480'.")
     p_chk.add_argument("--portrait", "--rotation", dest="portrait", type=str, choices=["cw", "ccw", "none"], default="none", help="Camera rotation: 'none' for horizontal/landscape mount, 'cw', or 'ccw' (default: 'none').")
     p_chk.add_argument("--preview", action="store_true", help="Open an interactive live OpenCV preview window for orientation verification (press Q or ESC to exit).")
     p_chk.add_argument("--out", type=str, default="scan_output", help="Output directory to save check snapshot into DIR/check/.")
@@ -257,6 +258,7 @@ def _run_capture(args: argparse.Namespace) -> int:
         print("Press 'Q' or ESC in preview window to exit.\n")
         from realsense_measure.fullbody.capture_ui import render_frame
         window_name = f"RealSense Live Capture Preview - {orient_label} [Press Q to Exit]"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         try:
             while True:
                 c, r, f, ts = cam.read_raw_filtered()
@@ -284,8 +286,18 @@ def _run_capture(args: argparse.Namespace) -> int:
                         "burst_progress": 0.0,
                         "last_rejection_reason": "Preview Only (No Recording)",
                     }
-                    display_frame = render_frame(snapshot, c, f if f is not None else d_m)
-                    cv2.imshow(window_name, display_frame)
+                    colorized_depth = getattr(cam, "last_colorized", None)
+                    depth_for_vis = colorized_depth if colorized_depth is not None else (f if f is not None else d_m)
+                    display_frame = render_frame(snapshot, c, depth_for_vis)
+                    disp_out = display_frame
+                    if display_frame.shape[1] > 1200:
+                        s = 1200.0 / display_frame.shape[1]
+                        disp_out = cv2.resize(
+                            display_frame,
+                            (1200, int(round(display_frame.shape[0] * s))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    cv2.imshow(window_name, disp_out)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):
@@ -530,14 +542,24 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     """Verify RealSense orientation, FOV, and depth sanity (no session)."""
     portrait = getattr(args, "portrait", "none")
     orient_label = "LANDSCAPE (no rotation)" if portrait == "none" else f"PORTRAIT {portrait.upper()}"
+    res_str = getattr(args, "resolution", "1280x720")
 
     if getattr(args, "fake", False):
         from tests.fullbody.fake_camera import FakeCamera
-        # Landscape fake camera: native 848x480
-        cam = FakeCamera(width=848, height=480, depth_scale=0.001, depth_units="sensor_units")
+        if "x" in res_str:
+            w_c, h_c = [int(v) for v in res_str.lower().split("x")]
+        else:
+            w_c, h_c = 1280, 720
+        if portrait in ("cw", "ccw"):
+            w_c, h_c = h_c, w_c
+        cam = FakeCamera(width=w_c, height=h_c, depth_scale=0.001, depth_units="sensor_units")
     else:
         from realsense_measure.fullbody.capture_camera import RealSenseCaptureAdapter, full_body_camera_config
-        cam_cfg = full_body_camera_config(portrait_rotation=portrait)
+        cam_cfg = full_body_camera_config(
+            portrait_rotation=portrait,
+            resolution=res_str,
+            raw_only=True,
+        )
         cam = RealSenseCaptureAdapter(camera_config=cam_cfg, portrait_rotation=portrait)
 
     try:
@@ -553,6 +575,7 @@ def _run_check_camera(args: argparse.Namespace) -> int:
         if getattr(args, "preview", False):
             from realsense_measure.fullbody.capture_ui import render_frame
             window_name = f"RealSense Camera Check - {orient_label} [Press Q to Exit]"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             print("\n" + "=" * 60)
             print("REALSENSE CAMERA INTERACTIVE PREVIEW MODE")
             print("=" * 60)
@@ -586,8 +609,18 @@ def _run_check_camera(args: argparse.Namespace) -> int:
                         "burst_progress": 0.0,
                         "last_rejection_reason": "Live Camera Check (Preview Mode)",
                     }
-                    display_frame = render_frame(snapshot, c, f if f is not None else d_m)
-                    cv2.imshow(window_name, display_frame)
+                    colorized_depth = getattr(cam, "last_colorized", None)
+                    depth_for_vis = colorized_depth if colorized_depth is not None else (f if f is not None else d_m)
+                    display_frame = render_frame(snapshot, c, depth_for_vis)
+                    disp_out = display_frame
+                    if display_frame.shape[1] > 1200:
+                        s = 1200.0 / display_frame.shape[1]
+                        disp_out = cv2.resize(
+                            display_frame,
+                            (1200, int(round(display_frame.shape[0] * s))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    cv2.imshow(window_name, disp_out)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):
@@ -597,14 +630,16 @@ def _run_check_camera(args: argparse.Namespace) -> int:
             except Exception:
                 pass
         else:
-            # Stream for approx 5 seconds or until frames acquired
+            # Stream for approx 2.0 seconds to stabilize exposure and capture snapshot
             start_time = time.time()
-            while (time.time() - start_time) < 5.0:
+            while (time.time() - start_time) < 2.0 or last_color is None:
                 c, r, f, ts = cam.read_raw_filtered()
                 if c is not None and r is not None:
                     last_color = c
                     last_depth = r
                 time.sleep(0.033)
+                if (time.time() - start_time) > 6.0:
+                    break
     finally:
         cam.stop()
 
@@ -616,6 +651,42 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     intr = cam.intrinsics
     scale = cam.depth_scale
     h, w = last_depth.shape[:2]
+
+    # Stream profile negotiation verification against requested configuration
+    stream_profiles = getattr(cam, "stream_profiles", {})
+    depth_p = stream_profiles.get("depth", {})
+    color_p = stream_profiles.get("color", {})
+    depth_w = int(depth_p.get("width", intr.get("width", w)))
+    depth_h = int(depth_p.get("height", intr.get("height", h)))
+    depth_fps = int(depth_p.get("fps", 30))
+    depth_fmt = str(depth_p.get("format", "z16"))
+    color_w = int(color_p.get("width", intr.get("width", w)))
+    color_h = int(color_p.get("height", intr.get("height", h)))
+    color_fps = int(color_p.get("fps", 30))
+    color_fmt = str(color_p.get("format", "bgr8"))
+
+    req_native_w, req_native_h = [int(v) for v in res_str.lower().split("x")] if "x" in res_str else (1280, 720)
+    req_fps = 30
+
+    # Allow portrait rotation where dimensions are transposed
+    depth_match = bool(
+        (depth_w == req_native_w and depth_h == req_native_h and depth_fps == req_fps)
+        or (depth_w == req_native_h and depth_h == req_native_w and depth_fps == req_fps)
+    )
+    color_match = bool(
+        (color_w == req_native_w and color_h == req_native_h and color_fps == req_fps)
+        or (color_w == req_native_h and color_h == req_native_w and color_fps == req_fps)
+    )
+    profile_ok = bool(depth_match and color_match)
+
+    if not profile_ok:
+        print("\n" + "!" * 64)
+        print("[WARNING] STREAM PROFILE MISMATCH DETECTED!")
+        print(f"  Requested Configuration: {res_str} @ {req_fps} fps")
+        print(f"  Actual Color Stream:     {color_w}x{color_h} @ {color_fps} fps ({color_fmt})")
+        print(f"  Actual Depth Stream:     {depth_w}x{depth_h} @ {depth_fps} fps ({depth_fmt})")
+        print("  Device failed to negotiate requested resolution or frame rate!")
+        print("!" * 64 + "\n")
 
     d_m = last_depth.astype(np.float32) * (scale if cam.depth_units == "sensor_units" else 1.0)
     roi = d_m[int(0.25 * h) : int(0.75 * h), int(0.25 * w) : int(0.75 * w)]
@@ -670,17 +741,22 @@ def _run_check_camera(args: argparse.Namespace) -> int:
         Path(args.out).parent / "background",
     ]
     bg_depth_file = next((p / "background_depth.npy" for p in bg_candidates if (p / "background_depth.npy").exists()), None)
+    bg_depth_map: Optional[np.ndarray] = None
 
     if bg_depth_file is not None:
         try:
-            bg_depth_map = np.load(str(bg_depth_file)).astype(np.float32)
-            from realsense_measure.fullbody.fusion import compute_foreground_mask
-            fg_mask = compute_foreground_mask(d_m, bg_depth_map, cfg_chk)
-            if np.sum(fg_mask) >= 200:
-                fg_rows = np.where(fg_mask)[0]
-                v_head_top = float(np.min(fg_rows))
-                v_sole = float(np.max(fg_rows))
-                framing_source = f"background_foreground_mask ({bg_depth_file.parent.name})"
+            loaded_bg = np.load(str(bg_depth_file)).astype(np.float32)
+            if loaded_bg.shape[:2] == (h, w):
+                bg_depth_map = loaded_bg
+                from realsense_measure.fullbody.fusion import compute_foreground_mask
+                fg_mask_bg = compute_foreground_mask(d_m, bg_depth_map, cfg_chk)
+                if np.sum(fg_mask_bg) >= 200:
+                    fg_rows = np.where(fg_mask_bg)[0]
+                    v_head_top = float(np.min(fg_rows))
+                    v_sole = float(np.max(fg_rows))
+                    framing_source = f"background_foreground_mask ({bg_depth_file.parent.name})"
+            else:
+                logger.debug(f"Background resolution {loaded_bg.shape[1]}x{loaded_bg.shape[0]} does not match live stream {w}x{h}; ignoring.")
         except Exception as exc:
             logger.debug(f"Failed foreground mask from background depth: {exc}")
 
@@ -758,7 +834,68 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     fy = float(intr.get("fy", 427.0))
     vertical_coverage_m = float(h * z_eval / fy) if fy > 0 else 0.0
 
-    is_accepted = bool(head_ok and feet_ok and floor_ok and standoff_ok and pitch_ok)
+    # -------------------------------------------------------------
+    # Framing and Central 20x20 Window Depth Analysis
+    # -------------------------------------------------------------
+    from realsense_measure.fullbody.capture_controller import subject_mask
+    fg_m = subject_mask(d_m, bg_depth_map, cfg_chk, allow_missing=True)
+
+    img_cx = float(w) / 2.0
+    img_cy = float(h) / 2.0
+
+    blob_found = False
+    blob_area_px = 0
+    blob_area_pct = 0.0
+    offset_x_px: Optional[float] = None
+    offset_y_px: Optional[float] = None
+    offset_x_pct: Optional[float] = None
+    offset_y_pct: Optional[float] = None
+    touches_border = False
+    touched_borders: List[str] = []
+
+    if np.any(fg_m):
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            fg_m.astype(np.uint8), connectivity=8
+        )
+        if num_labels > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            largest_idx = 1 + int(np.argmax(areas))
+            blob_area_px = int(stats[largest_idx, cv2.CC_STAT_AREA])
+            if blob_area_px >= 50:
+                blob_found = True
+                blob_area_pct = (blob_area_px / float(h * w)) * 100.0
+                blob_cx = float(centroids[largest_idx][0])
+                blob_cy = float(centroids[largest_idx][1])
+                offset_x_px = blob_cx - img_cx
+                offset_y_px = blob_cy - img_cy
+                offset_x_pct = (offset_x_px / float(w)) * 100.0
+                offset_y_pct = (offset_y_px / float(h)) * 100.0
+
+                blob_mask = (labels == largest_idx)
+                if np.any(blob_mask[0, :]):
+                    touched_borders.append("top")
+                if np.any(blob_mask[h - 1, :]):
+                    touched_borders.append("bottom")
+                if np.any(blob_mask[:, 0]):
+                    touched_borders.append("left")
+                if np.any(blob_mask[:, w - 1]):
+                    touched_borders.append("right")
+                touches_border = len(touched_borders) > 0
+
+    # Central 20x20 window median depth
+    cy_int = int(round(img_cy))
+    cx_int = int(round(img_cx))
+    r_min = max(0, cy_int - 10)
+    r_max = min(h, r_min + 20)
+    c_min = max(0, cx_int - 10)
+    c_max = min(w, c_min + 20)
+    center_window = d_m[r_min:r_max, c_min:c_max]
+    valid_window = center_window[(center_window > 0.05) & np.isfinite(center_window)]
+    center_20x20_med_m = float(np.median(valid_window)) if len(valid_window) > 0 else None
+    center_20x20_valid_cnt = int(len(valid_window))
+    center_20x20_total_cnt = int(center_window.size)
+
+    is_accepted = bool(profile_ok and head_ok and feet_ok and floor_ok and standoff_ok and pitch_ok)
 
     print("\n" + "=" * 64)
     print("REALSENSE CAMERA CHECK REPORT")
@@ -767,6 +904,9 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     print(f"Serial Number:      {dev_info.get('serial_number', 'UNKNOWN')}")
     print(f"Firmware Version:   {dev_info.get('firmware_version', 'UNKNOWN')}")
     print(f"Depth Scale:        {scale}")
+    print(f"Requested Profile:  {res_str} @ {req_fps} fps")
+    print(f"Actual Color Stream:{color_w}x{color_h} @ {color_fps} fps ({color_fmt})")
+    print(f"Actual Depth Stream:{depth_w}x{depth_h} @ {depth_fps} fps ({depth_fmt})")
     print(f"Stream Resolution:  {intr.get('width')}x{intr.get('height')}")
     print(f"Intrinsics:         fx={intr.get('fx'):.2f}, fy={intr.get('fy'):.2f}, cx={intr.get('cx'):.2f}, cy={intr.get('cy'):.2f}")
     print(f"Orientation:        {orient_label}")
@@ -774,6 +914,19 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     print(f"ROI Median Depth:   {med_depth_m:.3f} m")
     print(f"ROI Valid Fraction: {valid_frac * 100.0:.1f} %")
     print(f"Vertical Coverage:  {vertical_coverage_m:.2f} m (at {z_eval:.2f} m standoff)")
+    print("-" * 64)
+    print("FRAMING & FOREGROUND BLOB ANALYSIS:")
+    if blob_found:
+        border_status = f"YES ({', '.join(touched_borders)})" if touches_border else "NO (clear of all 4 borders)"
+        print(f"  Foreground Blob:           Found ({blob_area_px} px, {blob_area_pct:.2f}% of image)")
+        print(f"  Horizontal Centre Offset:  {offset_x_px:+.1f} px ({offset_x_pct:+.1f}% from centre)")
+        print(f"  Vertical Centre Offset:    {offset_y_px:+.1f} px ({offset_y_pct:+.1f}% from centre)")
+        print(f"  Touches Image Border:      {border_status}")
+    else:
+        print("  Foreground Blob:           None detected")
+        print(f"  Touches Image Border:      NO")
+    center_desc = f"{center_20x20_med_m:.3f} m ({center_20x20_valid_cnt}/{center_20x20_total_cnt} valid px)" if center_20x20_med_m is not None else "N/A (no valid depth)"
+    print(f"  Central 20x20 Median Depth:{center_desc}")
     print("-" * 64)
     print("COVERAGE & RECOMMENDED STANDOFF (5% MARGIN):")
     print(f"  Vertical coverage rate:   {cov_180.vertical_rate_m_per_m:.2f} m/m")
@@ -783,6 +936,7 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     print(f"  Recommended standoff for H=1.90m: {cov_190.recommended_standoff_m:.2f} m")
     print("-" * 64)
     print("AUTOMATIC ACCEPTANCE CHECKS:")
+    prof_desc = f"PASS ({depth_w}x{depth_h}@{depth_fps}fps matches requested {res_str})" if profile_ok else f"FAIL (negotiated depth={depth_w}x{depth_h}@{depth_fps}fps, color={color_w}x{color_h}@{color_fps}fps vs requested {res_str})"
     warn_str = " [WARN: >15% unused vertical space]" if head_warn else ""
     if head_margin_pct is not None:
         head_desc = f"PASS (margin={head_margin_pct:.1f}%, row={v_head_top:.1f}px >= {margin_px}px){warn_str}" if head_ok else f"FAIL (margin={head_margin_pct:.1f}%, row={v_head_top:.1f}px < {margin_px}px)"
@@ -797,11 +951,12 @@ def _run_check_camera(args: argparse.Namespace) -> int:
     floor_desc = f"PASS (inliers={floor.inlier_count}, normal=[{floor.normal[0]:.2f}, {floor.normal[1]:.2f}, {floor.normal[2]:.2f}])" if floor_ok else "FAIL (floor plane not found)"
     standoff_desc = f"PASS ({med_depth_m:.2f}m in [{cfg_chk.capture_dist_min_m:.2f}, {cfg_chk.capture_dist_max_m:.2f}]m)" if standoff_ok else f"FAIL ({med_depth_m:.2f}m out of [{cfg_chk.capture_dist_min_m:.2f}, {cfg_chk.capture_dist_max_m:.2f}]m)"
     pitch_desc = f"PASS ({pitch_deg:.1f} deg <= 15.0 deg)" if pitch_ok else (f"FAIL/WARN ({pitch_deg:.1f} deg > 15.0 deg)" if pitch_deg is not None else "FAIL (no floor plane)")
-    print(f"  1. Head in frame (>=4%):   {head_desc}")
-    print(f"  2. Sole in frame (>=4%):   {feet_desc}")
-    print(f"  3. Floor pixels visible:   {floor_desc}")
-    print(f"  4. Standoff in config:     {standoff_desc}")
-    print(f"  5. Camera pitch <= 15 deg: {pitch_desc}")
+    print(f"  1. Stream profile match:   {prof_desc}")
+    print(f"  2. Head in frame (>=4%):   {head_desc}")
+    print(f"  3. Sole in frame (>=4%):   {feet_desc}")
+    print(f"  4. Floor pixels visible:   {floor_desc}")
+    print(f"  5. Standoff in config:     {standoff_desc}")
+    print(f"  6. Camera pitch <= 15 deg: {pitch_desc}")
     print("-" * 64)
     print(f"OVERALL ACCEPTANCE:          {'ACCEPTED' if is_accepted else 'REJECTED'}")
     print("=" * 64 + "\n")
@@ -822,6 +977,10 @@ def _run_check_camera(args: argparse.Namespace) -> int:
         f.write(f"serial_number: {dev_info.get('serial_number')}\n")
         f.write(f"firmware_version: {dev_info.get('firmware_version')}\n")
         f.write(f"depth_scale: {scale}\n")
+        f.write(f"requested_resolution: {res_str}\n")
+        f.write(f"negotiated_depth_stream: {depth_w}x{depth_h}@{depth_fps}fps\n")
+        f.write(f"negotiated_color_stream: {color_w}x{color_h}@{color_fps}fps\n")
+        f.write(f"stream_profile_match: {profile_ok}\n")
         f.write(f"resolution: {intr.get('width')}x{intr.get('height')}\n")
         f.write(f"intrinsics: fx={intr.get('fx')}, fy={intr.get('fy')}, cx={intr.get('cx')}, cy={intr.get('cy')}\n")
         f.write(f"portrait_rotation: {args.portrait}\n")
@@ -843,6 +1002,17 @@ def _run_check_camera(args: argparse.Namespace) -> int:
         f.write(f"sole_margin_pct: {sole_margin_pct if sole_margin_pct is not None else 0.0:.2f}\n")
         f.write(f"floor_visible: {floor_ok}\n")
         f.write(f"framing_source: {framing_source}\n")
+        f.write(f"foreground_blob_found: {blob_found}\n")
+        f.write(f"foreground_blob_area_px: {blob_area_px}\n")
+        f.write(f"foreground_blob_area_pct: {blob_area_pct:.2f}\n")
+        f.write(f"foreground_offset_x_px: {offset_x_px if offset_x_px is not None else 0.0:.1f}\n")
+        f.write(f"foreground_offset_y_px: {offset_y_px if offset_y_px is not None else 0.0:.1f}\n")
+        f.write(f"foreground_offset_x_pct: {offset_x_pct if offset_x_pct is not None else 0.0:.2f}\n")
+        f.write(f"foreground_offset_y_pct: {offset_y_pct if offset_y_pct is not None else 0.0:.2f}\n")
+        f.write(f"touches_border: {touches_border}\n")
+        f.write(f"touched_borders: {','.join(touched_borders) if touched_borders else 'none'}\n")
+        f.write(f"central_20x20_median_depth_m: {center_20x20_med_m if center_20x20_med_m is not None else 0.0:.3f}\n")
+        f.write(f"central_20x20_valid_px: {center_20x20_valid_cnt}\n")
         f.write(f"automatic_acceptance: {'ACCEPTED' if is_accepted else 'REJECTED'}\n")
 
     print(f"Snapshot saved to: {check_dir}")

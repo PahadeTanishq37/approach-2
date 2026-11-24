@@ -107,6 +107,8 @@ class RealSenseCaptureAdapter:
         self._intrinsics: Dict[str, Any] = {}
         self._device_info: Dict[str, Any] = {}
         self._stream_profile_str: str = ""
+        self._stream_profiles: Dict[str, Any] = {}
+        self._last_colorized: Optional[np.ndarray] = None
 
     def start(self) -> None:
         """Start the camera pipeline, drop warm-up frames, and cache intrinsics."""
@@ -144,6 +146,7 @@ class RealSenseCaptureAdapter:
             exposure_depth_us = None
             exposure_color_us = None
             visual_preset_str = None
+            stream_profiles: Dict[str, Any] = {}
             try:
                 pipeline = getattr(self._camera, "pipeline", None)
                 if pipeline is not None:
@@ -151,6 +154,26 @@ class RealSenseCaptureAdapter:
                     if profile is not None:
                         dev = profile.get_device()
                         import pyrealsense2 as rs
+                        try:
+                            ds = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+                            stream_profiles["depth"] = {
+                                "width": int(ds.width()),
+                                "height": int(ds.height()),
+                                "fps": int(ds.fps()),
+                                "format": str(ds.format()),
+                            }
+                        except Exception:
+                            pass
+                        try:
+                            cs = profile.get_stream(rs.stream.color).as_video_stream_profile()
+                            stream_profiles["color"] = {
+                                "width": int(cs.width()),
+                                "height": int(cs.height()),
+                                "fps": int(cs.fps()),
+                                "format": str(cs.format()),
+                            }
+                        except Exception:
+                            pass
                         for s in dev.query_sensors():
                             s_name = s.get_info(rs.camera_info.name).lower() if s.supports(rs.camera_info.name) else ""
                             if "depth" in s_name or "stereo" in s_name:
@@ -169,6 +192,13 @@ class RealSenseCaptureAdapter:
                                     exposure_color_us = float(s.get_option(rs.option.exposure))
             except Exception as opt_exc:
                 logger.debug(f"Hardware sensor option query skipped: {opt_exc}")
+
+            if not stream_profiles:
+                stream_profiles = {
+                    "depth": {"width": self.camera_config.width, "height": self.camera_config.height, "fps": int(self.camera_config.fps), "format": "z16"},
+                    "color": {"width": self.camera_config.width, "height": self.camera_config.height, "fps": int(self.camera_config.fps), "format": "bgr8"},
+                }
+            self._stream_profiles = stream_profiles
 
             # Cache post-rotation intrinsics
             intr_o3d = getattr(self._camera, "intrinsics_o3d", None)
@@ -290,6 +320,16 @@ class RealSenseCaptureAdapter:
         return dict(self._intrinsics)
 
     @property
+    def stream_profiles(self) -> Dict[str, Any]:
+        """Dictionary of negotiated stream profiles for 'depth' and 'color'."""
+        return dict(self._stream_profiles)
+
+    @property
+    def last_colorized(self) -> Optional[np.ndarray]:
+        """Cached 3-channel BGR SDK-colorized depth image from last read, if available."""
+        return self._last_colorized
+
+    @property
     def depth_scale(self) -> float:
         if self._camera is not None and getattr(self._camera, "depth_scale", None) is not None:
             return float(self._camera.depth_scale)
@@ -304,6 +344,7 @@ class RealSenseCaptureAdapter:
         info = dict(self._device_info)
         info["depth_scale"] = self.depth_scale
         info["stream_profile"] = self._stream_profile_str
+        info["stream_profiles"] = self.stream_profiles
         info["intrinsics"] = self.intrinsics
         return info
 
@@ -335,6 +376,7 @@ class RealSenseCaptureAdapter:
                 raise RuntimeError(f"RealSense camera disconnected or hardware failed: {exc}") from exc
 
             if color_bgr is not None and raw_z16 is not None:
+                self._last_colorized = depth_color_bgr
                 ts_ms = frame_meta.get("timestamp_ms", 0.0) if frame_meta else 0.0
                 ts_s = float(ts_ms) / 1000.0 if ts_ms > 0 else time.time()
                 return color_bgr, raw_z16, depth_filtered_m, ts_s
