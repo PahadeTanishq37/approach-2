@@ -21,11 +21,12 @@ logger = logging.getLogger(__name__)
 def colorize_depth_m(
     depth_m: np.ndarray,
     min_m: float = 0.30,
-    max_m: float = 3.00,
+    max_m: float = 4.50,
 ) -> np.ndarray:
     """Convert float32 metric depth array to BGR JET colormap visualization."""
-    valid_mask = (depth_m > 0.05) & (depth_m <= max_m)
-    depth_clamped = np.clip(depth_m, min_m, max_m)
+    valid_mask = (depth_m > 0.05) & np.isfinite(depth_m)
+    depth_clean = np.where(valid_mask, depth_m, min_m)
+    depth_clamped = np.clip(depth_clean, min_m, max_m)
     norm = ((depth_clamped - min_m) / max(1e-3, (max_m - min_m)) * 255.0).astype(np.uint8)
     # Invert so near is warm (red) and far is cool (blue)
     norm_inv = 255 - norm
@@ -278,7 +279,7 @@ def run_ui_loop(
     In headless mode, runs pure stepping without calling cv2.imshow or cv2.waitKey.
     """
     if not headless:
-        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     step_count = 0
     last_console_log_t = 0.0
@@ -348,10 +349,13 @@ def run_ui_loop(
 
                 frame = render_frame(snapshot, color, depth)
                 disp_frame = frame
-                if frame.shape[1] > 1920:
+                if frame.shape[1] > 1200:
+                    scale = 1200.0 / frame.shape[1]
+                    target_w = 1200
+                    target_h = int(round(frame.shape[0] * scale))
                     disp_frame = cv2.resize(
                         frame,
-                        (frame.shape[1] // 2, frame.shape[0] // 2),
+                        (target_w, target_h),
                         interpolation=cv2.INTER_AREA,
                     )
                 cv2.imshow(window_name, disp_frame)
