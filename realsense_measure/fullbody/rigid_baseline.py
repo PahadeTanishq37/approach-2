@@ -53,6 +53,7 @@ class StopPointCloud:
     residual_before_mm: float = 0.0
     residual_after_mm: float = 0.0
     bound_exceeded: bool = False
+    yaw_observable: bool = True
 
 
 @dataclass
@@ -228,8 +229,7 @@ def compute_nominal_alignment_matrix(
     Compute 4x4 matrix rotating stop k back into stop 0's orientation around the vertical axis.
     """
     nom_deg = nominal_angle_deg(stop_idx, n_stops)
-    turn_mult = 1.0 if turn_direction.lower() == "cw" else -1.0
-    rot_deg = -(nom_deg * turn_mult)
+    rot_deg = -nom_deg if turn_direction.lower() == "cw" else nom_deg
     rot_rad = math.radians(rot_deg)
 
     # 2D rotation in horizontal (X, Z) plane about (axis_x, axis_z)
@@ -261,17 +261,18 @@ def constrained_icp_refine(
     axis_z: float,
     max_yaw_deg: float = 5.0,
     max_trans_m: float = 0.03,
-) -> Tuple[np.ndarray, float, Tuple[float, float], float, float, bool]:
+) -> Tuple[np.ndarray, float, Tuple[float, float], float, float, bool, bool]:
     """
-    Constrained 3-DOF point-to-plane ICP refinement:
-    - Yaw delta in [-max_yaw_deg, +max_yaw_deg] around vertical axis
-    - Planar translation (dx, dz) in [-max_trans_m, +max_trans_m]
-    - Zero pitch, zero roll, zero vertical shift (dy = 0)
+    Constrained point-to-plane ICP refinement with observability check:
+    - Analyzes 3-DOF Hessian eigenvalues. If yaw is weakly constrained (e.g. rotationally
+      symmetric cylinder about own axis), freezes yaw at nominal and solves only 2-DOF translation.
+    - If yaw is observable, refines bounded 3-DOF [dx, dz, dyaw].
+    - Zero pitch, zero roll, zero vertical shift (dy = 0).
     
-    Returns: (T_refine, yaw_deg, (dx_mm, dz_mm), residual_before_mm, residual_after_mm, bound_exceeded)
+    Returns: (T_refine, yaw_deg, (dx_mm, dz_mm), residual_before_mm, residual_after_mm, bound_exceeded, yaw_observable)
     """
     if len(source_pcd.points) < 50 or len(target_pcd.points) < 50:
-        return np.eye(4), 0.0, (0.0, 0.0), 0.0, 0.0, False
+        return np.eye(4), 0.0, (0.0, 0.0), 0.0, 0.0, False, False
 
     # Ensure target has surface normals
     if not target_pcd.has_normals():
@@ -293,6 +294,37 @@ def constrained_icp_refine(
             res_before_sq.append((np.dot(p - q, n)) ** 2)
     residual_before_mm = float(np.sqrt(np.mean(res_before_sq)) * 1000.0) if res_before_sq else 0.0
 
+    # 1. Observability check via Hessian conditioning of 3-DOF ICP problem
+    src_eval = src_work.voxel_down_sample(0.008)
+    eval_pts = np.asarray(src_eval.points)
+    A_eval = np.zeros((3, 3), dtype=np.float64)
+    r_sq_list = []
+    eval_count = 0
+    for p in eval_pts:
+        _, idxs, dists = target_kdtree.search_knn_vector_3d(p, 1)
+        if not dists or dists[0] > 0.04 ** 2:
+            continue
+        q = target_pts[idxs[0]]
+        n = target_norms[idxs[0]]
+        arm_z = p[2] - axis_z
+        arm_x = p[0] - axis_x
+        r_sq_list.append(arm_x ** 2 + arm_z ** 2)
+        J_yaw = n[0] * arm_z - n[2] * arm_x
+        J = np.array([n[0], n[2], J_yaw], dtype=np.float64)
+        A_eval += np.outer(J, J)
+        eval_count += 1
+
+    r_char = math.sqrt(np.mean(r_sq_list)) if r_sq_list else 0.150
+    D_mat = np.diag([1.0, 1.0, 1.0 / r_char])
+    H_scaled = D_mat @ A_eval @ D_mat
+    eigvals = np.sort(np.linalg.eigvalsh(H_scaled))[::-1]
+    cond_ratio = float(eigvals[-1] / max(1e-12, eigvals[0])) if eval_count >= 20 else 0.0
+
+    # Yaw is observable if smallest eigenvalue ratio of scaled Hessian >= 0.015
+    yaw_observable = bool(cond_ratio >= 0.015 and eval_count >= 20)
+    if not yaw_observable:
+        logger.info(f"Yaw direction is weakly constrained (cond_ratio={cond_ratio:.2e}); freezing yaw at nominal.")
+
     # 3 pyramid levels (coarse to fine)
     levels = [
         {"voxel": 0.016, "dist_thresh": 0.05, "iters": 8},
@@ -305,6 +337,7 @@ def constrained_icp_refine(
     total_dz = 0.0
     bound_exceeded = False
     max_yaw_rad = math.radians(max_yaw_deg)
+    T_accum = np.eye(4, dtype=np.float64)
 
     for lvl in levels:
         v_size = lvl["voxel"]
@@ -315,42 +348,70 @@ def constrained_icp_refine(
         pts = np.asarray(src_sub.points)
         if len(pts) < 30:
             continue
+        if len(pts) > 2000:
+            pts = pts[::max(1, len(pts) // 2000)]
 
         for _ in range(lvl["iters"]):
-            # Build linear point-to-plane system: J @ [dx, dz, dyaw]^T = - r
-            A_mat = np.zeros((3, 3), dtype=np.float64)
-            b_vec = np.zeros(3, dtype=np.float64)
-            count = 0
+            if not yaw_observable:
+                # Freeze yaw at nominal, solve only 2-DOF planar translation
+                A_mat = np.zeros((2, 2), dtype=np.float64)
+                b_vec = np.zeros(2, dtype=np.float64)
+                count = 0
+                for p in pts:
+                    _, idxs, dists = target_kdtree.search_knn_vector_3d(p, 1)
+                    if not dists or dists[0] > d_thresh_sq:
+                        continue
+                    q = target_pts[idxs[0]]
+                    n = target_norms[idxs[0]]
+                    J = np.array([n[0], n[2]], dtype=np.float64)
+                    r = float(np.dot(p - q, n))
+                    A_mat += np.outer(J, J)
+                    b_vec += -r * J
+                    count += 1
 
-            for p in pts:
-                _, idxs, dists = target_kdtree.search_knn_vector_3d(p, 1)
-                if not dists or dists[0] > d_thresh_sq:
-                    continue
-                q = target_pts[idxs[0]]
-                n = target_norms[idxs[0]]
+                if count < 20:
+                    break
 
-                # J = [nx, nz, nx*(z - z0) - nz*(x - x0)]
-                arm_z = p[2] - axis_z
-                arm_x = p[0] - axis_x
-                J_yaw = n[0] * arm_z - n[2] * arm_x
-                J = np.array([n[0], n[2], J_yaw], dtype=np.float64)
-                r = float(np.dot(p - q, n))
+                A_mat += 1e-4 * np.eye(2)
+                try:
+                    delta = np.linalg.solve(A_mat, b_vec)
+                except np.linalg.LinAlgError:
+                    break
 
-                A_mat += np.outer(J, J)
-                b_vec += -r * J
-                count += 1
+                step_dx, step_dz, step_yaw = float(delta[0]), float(delta[1]), 0.0
+            else:
+                # Solve full 3-DOF point-to-plane system: J @ [dx, dz, dyaw]^T = - r
+                A_mat = np.zeros((3, 3), dtype=np.float64)
+                b_vec = np.zeros(3, dtype=np.float64)
+                count = 0
 
-            if count < 20:
-                break
+                for p in pts:
+                    _, idxs, dists = target_kdtree.search_knn_vector_3d(p, 1)
+                    if not dists or dists[0] > d_thresh_sq:
+                        continue
+                    q = target_pts[idxs[0]]
+                    n = target_norms[idxs[0]]
 
-            # Regularize slightly for numerical conditioning
-            A_mat += 1e-4 * np.eye(3)
-            try:
-                delta = np.linalg.solve(A_mat, b_vec)
-            except np.linalg.LinAlgError:
-                break
+                    arm_z = p[2] - axis_z
+                    arm_x = p[0] - axis_x
+                    J_yaw = n[0] * arm_z - n[2] * arm_x
+                    J = np.array([n[0], n[2], J_yaw], dtype=np.float64)
+                    r = float(np.dot(p - q, n))
 
-            step_dx, step_dz, step_yaw = delta[0], delta[1], delta[2]
+                    A_mat += np.outer(J, J)
+                    b_vec += -r * J
+                    count += 1
+
+                if count < 20:
+                    break
+
+                A_mat += 1e-4 * np.eye(3)
+                try:
+                    delta = np.linalg.solve(A_mat, b_vec)
+                except np.linalg.LinAlgError:
+                    break
+
+                step_dx, step_dz, step_yaw = float(delta[0]), float(delta[1]), float(delta[2])
 
             # Damping to prevent overshoot
             step_dx = float(np.clip(step_dx, -0.01, 0.01))
@@ -387,7 +448,11 @@ def constrained_icp_refine(
             T_inc[:3, 3] = t_inc
 
             src_work.transform(T_inc)
-            pts = np.asarray(src_work.points)
+            T_accum = T_inc @ T_accum
+            src_sub = src_work.voxel_down_sample(v_size)
+            pts = np.asarray(src_sub.points)
+            if len(pts) > 2000:
+                pts = pts[::max(1, len(pts) // 2000)]
 
     # Final residual
     res_after_sq = []
@@ -400,26 +465,20 @@ def constrained_icp_refine(
             res_after_sq.append((np.dot(p - q, n)) ** 2)
     residual_after_mm = float(np.sqrt(np.mean(res_after_sq)) * 1000.0) if res_after_sq else 0.0
 
-    # Build final cumulative transformation T_refine
-    cos_tot = math.cos(total_yaw_rad)
-    sin_tot = math.sin(total_yaw_rad)
-    R_tot = np.array([
-        [cos_tot, 0.0, sin_tot],
-        [0.0, 1.0, 0.0],
-        [-sin_tot, 0.0, cos_tot],
-    ])
-    t_tot = np.array([axis_x, 0.0, axis_z]) - R_tot @ np.array([axis_x, 0.0, axis_z]) + np.array([total_dx, 0.0, total_dz])
-    T_refine = np.eye(4)
-    T_refine[:3, :3] = R_tot
-    T_refine[:3, 3] = t_tot
+    # Build final cumulative transformation from T_accum
+    T_refine = T_accum
+    recovered_yaw_deg = float(math.degrees(math.atan2(T_accum[0, 2], T_accum[0, 0])))
+    recovered_dx_mm = float((T_accum[0, 3] - (axis_x - (T_accum[0, 0] * axis_x + T_accum[0, 2] * axis_z))) * 1000.0)
+    recovered_dz_mm = float((T_accum[2, 3] - (axis_z - (T_accum[2, 0] * axis_x + T_accum[2, 2] * axis_z))) * 1000.0)
 
     return (
         T_refine,
-        float(math.degrees(total_yaw_rad)),
-        (float(total_dx * 1000.0), float(total_dz * 1000.0)),
+        recovered_yaw_deg,
+        (recovered_dx_mm, recovered_dz_mm),
         residual_before_mm,
         residual_after_mm,
         bound_exceeded,
+        yaw_observable,
     )
 
 
@@ -515,24 +574,57 @@ def fuse_stops_tsdf(
 
     # Component counting and cleanup
     components_before = 0
+    components_gt_1cm2 = 0
+    largest_component_area_m2 = 0.0
+    fraction_area_removed = 0.0
+
     if len(mesh.vertices) > 0 and len(mesh.triangles) > 0:
         mesh.remove_duplicated_vertices()
         mesh.remove_degenerate_triangles()
         triangle_clusters, num_triangles, _ = mesh.cluster_connected_triangles()
         components_before = len(num_triangles)
 
-        if components_before > 1:
-            largest_cluster = int(np.argmax(num_triangles))
-            to_remove = [i for i, c in enumerate(triangle_clusters) if c != largest_cluster]
-            mesh.remove_triangles_by_index(to_remove)
-            mesh.remove_unreferenced_vertices()
+        # Vectorized triangle surface area calculation
+        v = np.asarray(mesh.vertices)
+        t = np.asarray(mesh.triangles)
+        v0 = v[t[:, 0]]
+        v1 = v[t[:, 1]]
+        v2 = v[t[:, 2]]
+        cross_prod = np.cross(v1 - v0, v2 - v0)
+        tri_areas = 0.5 * np.linalg.norm(cross_prod, axis=1)
+        total_area = float(np.sum(tri_areas))
+
+        cluster_arr = np.asarray(triangle_clusters)
+        cluster_areas = np.zeros(components_before, dtype=np.float64)
+        np.add.at(cluster_areas, cluster_arr, tri_areas)
+
+        # 1 cm^2 = 0.0001 m^2
+        components_gt_1cm2 = int(np.sum(cluster_areas > 0.0001))
+
+        if components_before > 0:
+            largest_cluster = int(np.argmax(cluster_areas))
+            largest_component_area_m2 = float(cluster_areas[largest_cluster])
+            area_removed = total_area - largest_component_area_m2
+            fraction_area_removed = float(area_removed / total_area) if total_area > 0 else 0.0
+
+            if components_before > 1:
+                to_remove = [i for i, c in enumerate(triangle_clusters) if c != largest_cluster]
+                mesh.remove_triangles_by_index(to_remove)
+                mesh.remove_unreferenced_vertices()
 
         mesh.compute_vertex_normals()
 
     if len(pcd.points) > 0 and not pcd.has_normals():
         pcd.estimate_normals()
 
-    return mesh, pcd, components_before
+    component_stats = {
+        "components_before_cleanup": components_before,
+        "components_area_gt_1cm2_before_cleanup": components_gt_1cm2,
+        "fraction_area_removed": round(fraction_area_removed, 6),
+        "largest_component_area_m2": round(largest_component_area_m2, 6),
+        "components_after_cleanup": 1 if components_before > 0 else 0,
+    }
+    return mesh, pcd, component_stats
 
 
 def run_rigid_baseline(
@@ -657,6 +749,9 @@ def run_rigid_baseline(
         fg_mask = compute_foreground_mask_simple(fused_d, bg_depth_m, cfg)
 
         pcd_cam = backproject_depth_to_pcd(fused_d, rep_col, fg_mask, fx, fy, cx, cy)
+        if len(pcd_cam.points) >= 30:
+            pcd_cam.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=25))
+            pcd_cam.orient_normals_towards_camera_location([0.0, 0.0, 0.0])
         pcd_grav = o3d.geometry.PointCloud(pcd_cam)
         pcd_grav.transform(T_cam_to_grav)
 
@@ -705,7 +800,7 @@ def run_rigid_baseline(
                     target_pcd += other.pcd_aligned
             target_pcd = target_pcd.voxel_down_sample(0.008)
 
-            T_ref, dyaw_deg, (dx_mm, dz_mm), res_bef, res_aft, bound_flag = constrained_icp_refine(
+            T_ref, dyaw_deg, (dx_mm, dz_mm), res_bef, res_aft, bound_flag, yaw_obs = constrained_icp_refine(
                 source_pcd=s.pcd_aligned,
                 target_pcd=target_pcd,
                 axis_x=axis_x,
@@ -720,6 +815,7 @@ def run_rigid_baseline(
             s.residual_before_mm = res_bef
             s.residual_after_mm = res_aft
             s.bound_exceeded = bound_flag
+            s.yaw_observable = yaw_obs
 
             # Apply refinement
             s.pcd_aligned.transform(T_ref)
@@ -732,6 +828,8 @@ def run_rigid_baseline(
                 "residual_before_mm": round(res_bef, 2),
                 "residual_after_mm": round(res_aft, 2),
                 "bound_exceeded": bound_flag,
+                "yaw_observable": yaw_obs,
+                "yaw_status": "observable" if yaw_obs else "unobservable",
             })
     else:
         for s in stops_data:
@@ -743,11 +841,13 @@ def run_rigid_baseline(
                 "residual_before_mm": 0.0,
                 "residual_after_mm": 0.0,
                 "bound_exceeded": False,
+                "yaw_observable": True,
+                "yaw_status": "unrefined",
             })
 
     # 7. TSDF Fusion
     sdf_trunc = 3.0 * voxel_size_m
-    fused_mesh, fused_pcd, components_before = fuse_stops_tsdf(
+    fused_mesh, fused_pcd, comp_stats = fuse_stops_tsdf(
         stops_data, voxel_size_m=voxel_size_m, sdf_trunc_m=sdf_trunc
     )
 
@@ -809,7 +909,11 @@ def run_rigid_baseline(
         "tsdf": {
             "voxel_size_m": voxel_size_m,
             "sdf_trunc_m": sdf_trunc,
-            "components_before_cleanup": components_before,
+            "components_before_cleanup": comp_stats["components_before_cleanup"],
+            "components_area_gt_1cm2_before_cleanup": comp_stats["components_area_gt_1cm2_before_cleanup"],
+            "fraction_area_removed": comp_stats["fraction_area_removed"],
+            "largest_component_area_m2": comp_stats["largest_component_area_m2"],
+            "components_after_cleanup": comp_stats["components_after_cleanup"],
             "mesh_vertices": len(fused_mesh.vertices),
             "mesh_triangles": len(fused_mesh.triangles),
             "cloud_points": len(fused_pcd.points),
@@ -827,4 +931,48 @@ def run_rigid_baseline(
         json.dump(report, f, indent=2)
 
     logger.info(f"Rigid baseline reconstruction finalized at {out_dir}")
+    print_rigid_summary(report)
     return report
+
+
+def print_rigid_summary(report: Dict[str, Any]) -> None:
+    """Print clean formatted console summary including honest component metrics."""
+    subj = report.get("subject_id", "UNKNOWN")
+    stype = report.get("subject_type", "unknown")
+    n_stops = report.get("n_stops", 0)
+    turn = report.get("turn_direction", "cw")
+    axis = report.get("rotation_axis", {})
+    tsdf = report.get("tsdf", {})
+    ref = report.get("refinement", [])
+
+    print("\n" + "=" * 78)
+    print("RIGID BASELINE RECONSTRUCTION REPORT")
+    print("=" * 78)
+    print(f"Subject:        {subj} ({stype})")
+    print(f"Protocol:       {n_stops} stops ({turn.upper()})")
+    print(f"Rotation Axis:  X={axis.get('x0_m', 0.0):.4f} m, Z={axis.get('z0_m', 0.0):.4f} m (spread: {axis.get('spread_mm', 0.0):.2f} mm)")
+    if ref:
+        print("-" * 78)
+        print(f"{'Stop':<5} | {'Nominal':<8} | {'Corrected':<10} | {'Status':<13} | {'Trans (dx, dz)':<18} | {'Residuals'}")
+        print("-" * 78)
+        for r in ref:
+            s_idx = r.get("stop_index", 0)
+            nom = r.get("nominal_yaw_deg", 0.0)
+            dyaw = r.get("yaw_correction_deg", 0.0)
+            status = r.get("yaw_status", "observable" if r.get("yaw_observable", True) else "unobservable")
+            tr = r.get("trans_correction_mm", [0.0, 0.0])
+            r_bef = r.get("residual_before_mm", 0.0)
+            r_aft = r.get("residual_after_mm", 0.0)
+            print(f"{s_idx:<5} | {nom:>6.1f} deg | {dyaw:>+7.2f} deg | {status:<13} | [{tr[0]:>5.1f}, {tr[1]:>5.1f}] mm | {r_bef:.1f} -> {r_aft:.1f} mm")
+
+    print("-" * 78)
+    print("COMPONENT & MESH METRICS (BEFORE & AFTER CLEANUP):")
+    print(f"  Components Before Cleanup:         {tsdf.get('components_before_cleanup', 0):,}")
+    print(f"  Components with Area > 1 cm^2:     {tsdf.get('components_area_gt_1cm2_before_cleanup', 0):,}")
+    print(f"  Largest Component Area:            {tsdf.get('largest_component_area_m2', 0.0):.4f} m^2")
+    frac_rem = tsdf.get('fraction_area_removed', 0.0)
+    print(f"  Area Removed by Largest-Comp:      {frac_rem * 100:.2f}% ({frac_rem:.6f})")
+    print(f"  Components After Cleanup:          {tsdf.get('components_after_cleanup', 1)}")
+    print(f"  Final Mesh Vertices / Triangles:   {tsdf.get('mesh_vertices', 0):,} / {tsdf.get('mesh_triangles', 0):,}")
+    print(f"  Final Point Cloud Points:          {tsdf.get('cloud_points', 0):,}")
+    print("=" * 78 + "\n")

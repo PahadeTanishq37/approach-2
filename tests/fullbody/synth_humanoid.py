@@ -137,10 +137,28 @@ def build_articulated_humanoid_mesh(
     m_torso = _tube(a_waist, b_waist, a_chest, b_chest, 1.02, 1.42)
     meshes.extend([m_pelvis, m_torso])
 
+    # Neck: tube continuously connecting torso top (Y=1.42, a=0.16, b=0.12) to head center (Y=1.65, r=0.09)
+    m_neck = _tube(a_chest, b_chest, 0.09, 0.09, 1.42, 1.65)
+    meshes.append(m_neck)
+
     # Head: sphere centered at Y = 1.65 m, radius 0.10 m -> crown exactly at Y = 1.75 m
     m_head = o3d.geometry.TriangleMesh.create_sphere(radius=0.10, resolution=20)
     m_head.translate([0.0, 1.65, 0.0])
     meshes.append(m_head)
+
+    # Shoulder spheres: radius 0.07 m at (+-0.18, 1.40, 0.0) deeply overlapping torso and arms
+    m_shoulder_l = o3d.geometry.TriangleMesh.create_sphere(radius=0.07, resolution=20)
+    m_shoulder_l.translate([0.18, 1.40, 0.0])
+    m_shoulder_r = o3d.geometry.TriangleMesh.create_sphere(radius=0.07, resolution=20)
+    m_shoulder_r.translate([-0.18, 1.40, 0.0])
+    meshes.extend([m_shoulder_l, m_shoulder_r])
+
+    # Hip spheres: radius 0.08 m at (+-0.09, 0.80, 0.0) deeply overlapping pelvis and legs
+    m_hip_l = o3d.geometry.TriangleMesh.create_sphere(radius=0.08, resolution=20)
+    m_hip_l.translate([0.09, 0.80, 0.0])
+    m_hip_r = o3d.geometry.TriangleMesh.create_sphere(radius=0.08, resolution=20)
+    m_hip_r.translate([-0.09, 0.80, 0.0])
+    meshes.extend([m_hip_l, m_hip_r])
 
     # Highest point visible from camera (geometric horizon)
     # Camera at (0, 0.90, -1.30), sphere center (0, 1.65, 0), radius 0.10
@@ -274,6 +292,45 @@ class SyntheticHumanoidCaptureRenderer:
             width, height, fx, fy, self.cx, self.cy
         )
 
+    def render_background(self) -> np.ndarray:
+        """
+        Render background depth containing only the floor plane quad.
+        """
+        f_verts = np.array([
+            [-4.0, 0.0, -4.0],
+            [-4.0, 0.0,  6.0],
+            [ 4.0, 0.0,  6.0],
+            [ 4.0, 0.0, -4.0],
+        ], dtype=np.float64)
+        f_tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        m_floor = o3d.geometry.TriangleMesh()
+        m_floor.vertices = o3d.utility.Vector3dVector(f_verts)
+        m_floor.triangles = o3d.utility.Vector3iVector(f_tris)
+
+        T_cam_world = np.array([
+            [-1.0,  0.0, 0.0,  0.0],
+            [ 0.0, -1.0, 0.0,  self.cam_height],
+            [ 0.0,  0.0, 1.0,  self.cam_dist],
+            [ 0.0,  0.0, 0.0,  1.0],
+        ], dtype=np.float64)
+        m_floor.transform(T_cam_world)
+
+        scene = o3d.t.geometry.RaycastingScene()
+        tmesh = o3d.t.geometry.TriangleMesh.from_legacy(m_floor)
+        scene.add_triangles(tmesh)
+        rays = o3d.t.geometry.RaycastingScene.create_rays_pinhole(
+            o3d.core.Tensor(self.intrinsics.intrinsic_matrix, dtype=o3d.core.Dtype.Float64),
+            o3d.core.Tensor(np.eye(4, dtype=np.float64)),
+            self.width,
+            self.height,
+        )
+        cast_res = scene.cast_rays(rays)
+        t_hit = cast_res["t_hit"].numpy()
+        bg_depth = np.zeros((self.height, self.width), dtype=np.float32)
+        hit_mask = np.isfinite(t_hit) & (t_hit < 4.0) & (t_hit > 0.3)
+        bg_depth[hit_mask] = t_hit[hit_mask].astype(np.float32)
+        return bg_depth
+
     def render_stops(
         self,
         num_stops: int = 8,
@@ -309,9 +366,9 @@ class SyntheticHumanoidCaptureRenderer:
             yaw_rad = np.deg2rad(actual_yaw)
             c, s = np.cos(yaw_rad), np.sin(yaw_rad)
             R_body = np.array([
-                [ c, 0, -s],
+                [ c, 0,  s],
                 [ 0, 1,  0],
-                [ s, 0,  c],
+                [-s, 0,  c],
             ], dtype=np.float64)
 
             # Apply body pose to mesh
